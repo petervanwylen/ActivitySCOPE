@@ -1899,6 +1899,10 @@ def train_extension_difficulty_classifier(orb_pred, final, orb, filter_csv="filt
     orb_pred["extension_difficulty"] = xgb_misl.predict_proba(
         orb_pred[misl_cols[:-1]].astype(float)
     )[:, 1]
+
+    # make sure that both orb_pre and final have extension_difficulty rounded to nearest 0.000001 since we think this is more readable than sci notation
+    orb_pred["extension_difficulty"] = orb_pred["extension_difficulty"].round(6)
+    final["extension_difficulty"] = final["extension_difficulty"].round(6)
     
     return orb_pred, final
 
