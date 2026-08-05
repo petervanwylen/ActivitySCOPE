@@ -1,13 +1,101 @@
 from datetime import datetime
 
+# Band -> V conversions, from the MPC API's v_conversion values.
+#
+# Replaces the earlier find_orb / BandConversion.txt heritage table. The
+# Johnson-Cousins bands are identical between the two; the differences are:
+#
+#   band   legacy   this table   delta
+#   u      +2.50    -2.50        -5.00  (sign error; corroborated by
+#                                        DePhOCUS, arXiv:2408.07474, -2.436
+#                                        +/- 0.045)
+#   w      -0.13    +0.16        +0.29  (sign)
+#   z      +0.26    +0.37        +0.11
+#   r      +0.14    +0.23        +0.09
+#   i      +0.32    +0.39        +0.07
+#   g      -0.35    -0.28        +0.07
+#   y      +0.32    +0.36        +0.04
+#   blank  -0.80     0.00        +0.80  (see below)
+#
+# Blank band is left UNADJUSTED. The MPC API has no blank-band entry at all,
+# and the MPC convention for a band whose v_conversion is null is to apply no
+# shift -- the same treatment IR, VR, W2-W4 and Lx get below. The legacy -0.80
+# and find_orb's +0.43 (an assumption that unfiltered ~ R) are both guesses
+# filling that gap, and they disagree by 1.23 mag, which is larger than any
+# genuine colour term in this table.
+#
+# Measured band-minus-V on the same objects, over 28,972 reduced magnitudes of
+# 60 numbered main-belt asteroids, puts blank at -0.24, and restricting to a
+# matched phase-angle window moves that by only 0.02 mag -- much nearer 0 than
+# either guess. Blank band is heavily concentrated in pre-2010 data, so a wrong
+# value here masquerades as an epoch-dependent drift: with -0.80 applied,
+# reduced magnitudes appeared to fade by 0.65 mag between 2000 and 2020 with no
+# physical cause.
+BLANK_BAND_SHIFT = 0.0
+
 V_BAND_CORRECTIONS = {
-    ' ': -0.8,
-    'U': -1.3, 'B': -0.8, 'g': -0.35, 'V': 0.0, 'r': 0.14,
-    'R': 0.4, 'C': 0.4, 'W': 0.4, 'i': 0.32, 'z': 0.26,
-    'I': 0.8, 'J': 1.2, 'w': -0.13, 'y': 0.32, 'L': 0.2,
-    'H': 1.4, 'K': 1.7, 'Y': 0.7, 'G': 0.28, 'v': 0.0,
-    'c': -0.05, 'o': 0.33, 'u': 2.5,
+    # V-equivalent by definition
+    'V': 0.0, 'v': 0.0, 'N': 0.0, 'T': 0.0, 'j': 0.0,
+
+    # single-character bands
+    'u': -2.50,   # Sloan u'
+    'U': -1.30,   # Johnson
+    'B': -0.80,
+    'g': -0.28,
+    'c': -0.05,   # ATLAS
+    'w': +0.16,   # PS1
+    'r': +0.23,
+    'G': +0.28,   # Gaia
+    'o': +0.33,   # ATLAS
+    'y': +0.36,
+    'z': +0.37,
+    'i': +0.39,
+    'C': +0.40,   # clear
+    'R': +0.40,
+    'W': +0.40,
+    'L': +0.20,
+    'Y': +0.70,
+    'I': +0.80,
+    'J': +1.20,
+    'H': +1.40,
+    'K': +1.70,
+
+    # unfiltered / no band reported
+    ' ': BLANK_BAND_SHIFT,
+
+    # ---- multi-character codes: ADES only ----------------------------------
+    # OBS80 carries a single band character in column 71, so these are never
+    # reached by extract_v_mag() below. They are here for callers parsing ADES.
+
+    # LSST/Rubin, from Veres & Chesley 2017 Table 4, C/S-group 50:50 mean
+    'Lu': -1.771, 'Lg': -0.349, 'Lr': +0.214,
+    'Li': +0.373, 'Lz': +0.350, 'Ly': +0.355,
+
+    # MPC codes with v_conversion = null, resolved through the filter letter
+    'Ac': -0.05,  # ATLAS c
+    'Ao': +0.33,  # ATLAS o
+    'Bj': -0.80,  # Johnson B
+    'Gb': +0.28,  # Gaia BP  -- see note below
+    'Gr': +0.28,  # Gaia RP  -- see note below
+    'Ic': +0.80,  # Cousins I
+    'Rc': +0.40,  # Cousins R
+    'Uj': -1.30,  # Johnson U
+    'Vj': 0.0,    # Johnson V
+    'Pg': -0.28, 'Pi': +0.39, 'Pr': +0.23,   # Pan-STARRS
+    'Pw': +0.16, 'Py': +0.36, 'Pz': +0.37,
+    'Sg': -0.28, 'Si': +0.39, 'Sr': +0.23, 'Sz': +0.37,   # Sloan
+    'UNK': BLANK_BAND_SHIFT,
+
+    # no recoverable filter -> left unadjusted
+    'IR': 0.0, 'VR': 0.0, 'Lx': 0.0,
+    'W2': 0.0, 'W3': 0.0, 'W4': 0.0,
 }
+
+# NOTE on Gb/Gr: these are Gaia BP and RP, for which the MPC gives no
+# conversion. They are resolved here to G (+0.28) following the same
+# uppercase-filter-letter rule that gives Rc->R and Ic->I. BP and RP are
+# genuinely much bluer and redder than G, so if either becomes common in the
+# data these two deserve their own measured values rather than this stand-in.
 
 
 def process_astrometry(lines):

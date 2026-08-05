@@ -1509,6 +1509,19 @@ def feature_engineering(orb):
         orb["vis_opp_mean_disc"] = np.nan
         orb["vis_opp_fluxsum_disc"] = np.nan
 
+    if "Principal_desig" in orb.columns:
+        # Palomar-Leiden ("2060 P-L") and Trojan-survey ("4020 T-2")
+        # designations have the same shape as a year but are not one, so require
+        # a genuine provisional designation: 4-digit year, space, two letters.
+        orb["desig_year"] = pd.to_numeric(
+            orb["Principal_desig"].astype("string").str.extract(
+                r"^((?:1[89]|20)\d{2})\s+[A-Z]{2}", expand=False
+            ),
+            errors="coerce",
+        ).astype(float)
+    else:
+        orb["desig_year"] = np.nan
+
     return orb
 
 
