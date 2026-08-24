@@ -39,3 +39,79 @@ Object,reason
 2020 SN84, multiopp mislinkage
 2013 YS132, multiopp mislinkage
 2016 UJ137, multiopp mislinkage
+2014 EJ101,PyRoOrb likely mislinkage: [drop2.37+mag2.13] MAG! dH=2.13 p=0.0006; DROP! 2.90x (arc fits 2.90x better without it)
+2016 FM189,PyRoOrb likely mislinkage: [mag2.6+drop1.77] MAG! dH=2.60 p=0.0000; DROP! 2.42x (arc fits 2.42x better without it)
+2016 JJ93,PyRoOrb likely mislinkage: [mag3+ramp0.6+drop0.51] MAG! dH=3.15 p=0.0000
+2016 UM125,PyRoOrb likely mislinkage: [drop1.79+mag1.65+ramp0.27+z0.01] MAG! dH=1.65 p=0.0009; DROP! 2.43x (arc fits 2.43x better without it)
+2018 PZ138,PyRoOrb likely mislinkage: [mag3+ramp0.16] MAG! dH=8.93 p=0.0000
+2022 BH58,PyRoOrb likely mislinkage: [mag3+drop0.16] MAG! dH=5.23 p=0.0000
+2025 TY59,PyRoOrb likely mislinkage: [mag1.11+dropobs1+drop0.86+ramp0.12] MAG dH=1.11 p=0.0233; DROPOBS 1/4 obs rejected -- every rejection in this arc
+2023 TN187,PyRoOrb likely mislinkage: [drop3+ramp0.06+z0.01] DROP! 5.71x (arc fits 5.71x better without it)
+2023 TQ187,PyRoOrb likely mislinkage: [drop3+z0.01] DROP! 9.52x (arc fits 9.52x better without it)
+2019 AK37,PyRoOrb likely mislinkage: [mag3+drop0.01] MAG! dH=3.25 p=0.0000
+2016 PT303,PyRoOrb likely mislinkage: [mag2.28+drop0.73] MAG! dH=2.28 p=0.0000
+2014 EG163,PyRoOrb likely mislinkage: [mag2.14+drop0.8] MAG! dH=2.14 p=0.0005
+2014 EG101,PyRoOrb likely mislinkage: [mag2.53+drop0.38] MAG! dH=2.53 p=0.0000
+2015 AR63,PyRoOrb likely mislinkage: [mag1.61+ramp1.11+drop0.05] MAG! dH=1.61 p=0.0001; RAMP 3.8sig in RA = 4.4x the rest
+2023 GG8,PyRoOrb likely mislinkage: [drop2.69] DROP! 3.15x (arc fits 3.15x better without it)
+2015 KP431,PyRoOrb likely mislinkage: [mag2.43+drop0.19] MAG! dH=2.43 p=0.0000
+2021 CE57,PyRoOrb likely mislinkage: [drop1.61+mag0.79+z0.13+ramp0.05] DROP 2.29x
+2022 XP10,PyRoOrb likely mislinkage: [mag1.81+ramp0.71+z0.04] MAG! dH=1.81 p=0.0003
+2014 EJ206,PyRoOrb likely mislinkage: [mag2.51+drop0.05] MAG! dH=2.51 p=0.0000
+2019 JW19,PyRoOrb likely mislinkage: [mag2.11+ramp0.39+drop0.04] MAG! dH=2.11 p=0.0000
+2007 HD87,PyRoOrb likely mislinkage: [mag1.92+drop0.59] MAG! dH=1.92 p=0.0000
+2010 RQ44,PyRoOrb likely mislinkage: [mag2.27+ramp0.12+drop0.1] MAG! dH=2.27 p=0.0000
+2023 RA172,PyRoOrb likely mislinkage: [drop2.41] DROP! 2.93x (arc fits 2.93x better without it)
+2024 CS27,PyRoOrb likely mislinkage: [drop2.34] DROP! 2.87x (arc fits 2.87x better without it)
+2014 UT307,PyRoOrb likely mislinkage: [mag2.05+drop0.22+z0.04] MAG! dH=2.05 p=0.0001
+2006 XC61,PyRoOrb likely mislinkage: [ramp1.25+drop1.04+z0.01] DROP 1.83x; RAMP 3.9sig in RA = 5.0x the rest
+2014 KH171,PyRoOrb likely mislinkage: [mag1.35+ramp0.52+drop0.38] MAG dH=1.35 p=0.0017
+2013 RN189,PyRoOrb likely mislinkage: [mag1.14+ramp0.95+drop0.14+z0.01] MAG dH=1.14 p=0.0052
+2010 JK165,PyRoOrb likely mislinkage: [mag1.24+ramp0.86+drop0.15] MAG dH=1.24 p=0.0023
+2016 GR166,PyRoOrb likely mislinkage: [mag2.15+z0.07] MAG! dH=2.15 p=0.0000
+2007 RR294,PyRoOrb likely mislinkage: [mag1.65+ramp0.4+drop0.15+z0.01] MAG! dH=1.65 p=0.0001
+2024 AR21,PyRoOrb likely mislinkage: [mag1.95+drop0.1+ramp0.04] MAG! dH=1.95 p=0.0000
+2024 AX12,PyRoOrb likely mislinkage: [mag1.92+drop0.14+z0.01] MAG! dH=1.92 p=0.0000
+2025 NA124,PyRoOrb likely mislinkage: [drop2.01+z0.03] DROP! 2.61x (arc fits 2.61x better without it)
+2016 GQ379,PyRoOrb likely mislinkage: [mag1.58+drop0.44] MAG! dH=1.58 p=0.0037
+2014 TT125,PyRoOrb likely mislinkage: [drop1.81+z0.18] DROP! 2.45x (arc fits 2.45x better without it)
+2013 GY171,PyRoOrb likely mislinkage: [ramp1.92+z0.01] RAMP 3.8sig in RA = 12.0x the rest
+2018 NH6,PyRoOrb likely mislinkage: [mag1.04+drop0.87] MAG dH=1.04 p=0.0085
+2015 HV123,PyRoOrb likely mislinkage: [mag1.7+drop0.2] MAG! dH=1.70 p=0.0000
+2019 UG158,PyRoOrb likely mislinkage: [mag1.48+ramp0.21+z0.15+drop0.04] MAG dH=1.48 p=0.0010
+2014 EQ217,PyRoOrb likely mislinkage: [mag1.85+drop0.04] MAG! dH=1.85 p=0.0008
+2015 BF413,PyRoOrb likely mislinkage: [mag1.04+drop0.66+ramp0.14] MAG dH=1.04 p=0.0152
+2020 HZ202,PyRoOrb likely mislinkage: [mag1.31+drop0.47+z0.01] MAG dH=1.31 p=0.0014
+2023 XT32,PyRoOrb likely mislinkage: [mag1.41+ramp0.26+z0.08+drop0.04] MAG dH=1.41 p=0.0014
+2022 EC19,PyRoOrb likely mislinkage: [ramp1.28+z0.33+drop0.08] RAMP 3.2sig in Dec = 5.1x the rest
+2024 RR204,PyRoOrb likely mislinkage: [mag1.08+z0.57+drop0.01] MAG dH=1.08 p=0.0109
+2012 VS23,PyRoOrb likely mislinkage: [mag1.63+z0.03] MAG! dH=1.63 p=0.0001
+2022 YV10,PyRoOrb likely mislinkage: [ramp1.35+drop0.16+z0.11] RAMP 2.8sig in RA = 5.4x the rest
+2014 EE114,PyRoOrb likely mislinkage: [mag1.59+drop0.03] MAG! dH=1.59 p=0.0071
+2021 UB97,PyRoOrb likely mislinkage: [drop1.6] DROP 2.28x
+2021 BJ19,PyRoOrb likely mislinkage: [mag1.27+drop0.31] MAG dH=1.27 p=0.0034
+2015 AJ136,PyRoOrb likely mislinkage: [mag1+drop0.54] MAG dH=1.00 p=0.0139
+2021 QO102,PyRoOrb likely mislinkage: [drop1.53+z0.01] DROP 2.22x
+2008 SM113,PyRoOrb likely mislinkage: [ramp1.49+drop0.04] RAMP 3.0sig in RA = 11.9x the rest
+2021 GZ131,PyRoOrb likely mislinkage: [mag1.33+drop0.06+z0.03] MAG dH=1.33 p=0.0138
+2023 RB163,PyRoOrb likely mislinkage: [ramp1.2+drop0.17] RAMP 4.3sig in RA = 4.8x the rest
+2023 WO48,PyRoOrb likely mislinkage: [drop1.35] DROP 2.08x
+2023 QA131,PyRoOrb likely mislinkage: [dropobs1+drop0.34] DROPOBS 1/3 obs rejected -- every rejection in this arc
+2022 QB235,PyRoOrb likely mislinkage: [ramp1.09+z0.14+drop0.1] RAMP 4.2sig in RA = 4.4x the rest
+2023 UY75,PyRoOrb likely mislinkage: [ramp1.32] RAMP 4.0sig in RA = 5.3x the rest
+2001 FO214,PyRoOrb likely mislinkage: [drop1.3+z0.01] DROP 2.04x
+2015 TS489,PyRoOrb likely mislinkage: [ramp1.21+drop0.09+z0.01] RAMP 2.4sig in Dec = 15.1x the rest
+2017 DO29,PyRoOrb likely mislinkage: [ramp1.24+drop0.04] RAMP 3.9sig in RA = 5.0x the rest
+2022 QU246,PyRoOrb likely mislinkage: [drop1.02+ramp0.22] DROP 1.82x
+2023 TF204,PyRoOrb likely mislinkage: [drop1.22] DROP 1.98x
+2021 CM40,PyRoOrb likely mislinkage: [drop1.2] DROP 1.96x
+2015 TJ353,PyRoOrb likely mislinkage: [mag1.01+ramp0.19] MAG dH=1.01 p=0.0306
+2014 JV150,PyRoOrb likely mislinkage: [mag1.04+z0.12] MAG dH=1.04 p=0.0154
+2023 SO92,PyRoOrb likely mislinkage: [ramp1.05+drop0.1] RAMP 2.1sig in RA = 7.8x the rest
+2021 VR85,PyRoOrb likely mislinkage: [ramp1.1+drop0.04] RAMP 2.3sig in RA = 4.4x the rest
+2022 HD25,PyRoOrb likely mislinkage: [ramp1.01+drop0.09+z0.03] RAMP 2.0sig in RA = 8.1x the rest
+2010 XN45,PyRoOrb likely mislinkage: [drop1.1+z0.01] DROP 1.88x
+2022 QP255,PyRoOrb likely mislinkage: [ramp1+drop0.1] RAMP 2.0sig in Dec = 6.3x the rest
+2003 QK81,PyRoOrb likely mislinkage: [mag1.09] MAG dH=1.09 p=0.0146
+2016 EU381,PyRoOrb likely mislinkage: [ramp1.01+drop0.05] RAMP 2.0sig in Dec = 4.6x the rest
+2025 FW29,PyRoOrb likely mislinkage: [drop1.02+z0.01] DROP 1.82x
