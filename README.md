@@ -50,7 +50,7 @@ pip install -r requirements.txt --extra-index-url https://download.pytorch.org/w
 
 ## Usage
 
-Start with the Jupyter Notebook `Start Here - ActivitySCOPE simplified demo.ipynb`. A second notebook, `More Complicated Workbook - only provided for the curious right now.ipynb`, contains additional explorations and some used for the paper.
+Start with the Jupyter Notebook `Start Here - ActivitySCOPE simplified demo.ipynb`. A second notebook, `More Complicated Workbook - including paper-specific items.ipynb`, contains additional explorations and some used for the paper.
 
 1.  **Data Preparation:** The notebook works with the MPC (Minor Planet Center) orbit database. You may need to download the latest `MPCORB` extended JSON format or similar datasets as specified in the notebook cells.
 2.  **Run the Notebook:** Execute the cells in order. The notebook performs the following steps:

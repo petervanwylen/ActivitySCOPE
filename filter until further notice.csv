@@ -39,6 +39,7 @@ Object,reason
 2020 SN84, multiopp mislinkage
 2013 YS132, multiopp mislinkage
 2016 UJ137, multiopp mislinkage
+2009 UP55, multiopp mislinkage
 2014 EJ101,PyRoOrb likely mislinkage: [drop2.37+mag2.13] MAG! dH=2.13 p=0.0006; DROP! 2.90x (arc fits 2.90x better without it)
 2016 FM189,PyRoOrb likely mislinkage: [mag2.6+drop1.77] MAG! dH=2.60 p=0.0000; DROP! 2.42x (arc fits 2.42x better without it)
 2016 JJ93,PyRoOrb likely mislinkage: [mag3+ramp0.6+drop0.51] MAG! dH=3.15 p=0.0000
