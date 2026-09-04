@@ -13,6 +13,7 @@ This module contains utility functions for:
 import os
 import shutil
 import time
+import warnings
 import urllib.request
 import pandas as pd
 import numpy as np
@@ -1288,12 +1289,6 @@ def feature_engineering(orb):
         # ephemeris used here are no longer trustworthy, so any solved event older
         # than this is treated as "no usable recent apparition."
         OPP_MAX_LOOKBACK_DAYS = 20.0 * 365.25
-        # Faint sentinel assigned to out-of-window events: fainter than any survey
-        # detection limit (the deepest single-visit depths are ~24.5-26), so the
-        # model reads it as effectively unobservable. The precise value is
-        # unimportant for tree-based models provided it sits clearly in the
-        # undetectable regime and is applied consistently.
-        VIS_OPP_FAINT = 28.0
 
         def _wrap_pi(ang):
             return (ang + np.pi) % TWO_PI - np.pi
@@ -1415,36 +1410,106 @@ def feature_engineering(orb):
                  + 5.0 * np.log10(r_o_safe * Delta_o_safe)
                  - 2.5 * np.log10(phi_blend_o))  # (N, 5), col 0 = most recent
 
-        # Replace events whose solved time falls outside the reliable lookback
-        # window with a faint sentinel (see OPP_MAX_LOOKBACK_DAYS / VIS_OPP_FAINT).
-        # This guards the near-1-yr-period regime, whose diverging synodic period
-        # otherwise places "recent" apparitions centuries before the epoch where
-        # the fixed-element reconstruction is meaningless. For such objects all
-        # 17 events fall out of window and every vis_opp_* collapses to the
-        # sentinel, correctly flagging the absence of a usable recent apparition.
         stale = (Epoch_col - t_opp) > OPP_MAX_LOOKBACK_DAYS
-        V_opp = np.where(stale, VIS_OPP_FAINT, V_opp)
 
-        for j in range(N_OPP):
-            orb[f"vis_opp_{j + 1}"] = V_opp[:, j].astype(float)
+        vis_orbit = orb["vis_orbit_mag_multi"].to_numpy(dtype=np.float64)
+        V_opp_clean = np.where(stale, np.nan, V_opp)
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            opp_mean_clean = np.nanmean(V_opp_clean, axis=1)
+            opp_mean5_clean = np.nanmean(V_opp_clean[:, :5], axis=1)
+        orb["vis_opp_mean"] = opp_mean_clean.astype(float)
+        orb["vis_opp_minus_orbit"] = (opp_mean_clean - vis_orbit).astype(float)
+        orb["vis_opp5_minus_orbit"] = (opp_mean5_clean - vis_orbit).astype(float)
+        # Recent-vs-long-run apparition brightness: is the object moving into or
+        # out of its favourable phase (5-apparition mean minus 17-apparition mean).
+        orb["vis_opp5_minus_opp17"] = (opp_mean5_clean - opp_mean_clean).astype(float)
 
-        # Summary statistics across the 17 solved apparitions. vis_opp_min is
-        # the brightest event; vis_opp_max the faintest; mean/median describe
-        # the typical apparition brightness.
-        orb["vis_opp_mean"] = V_opp.mean(axis=1).astype(float)
-        orb["vis_opp_mean_5"] = V_opp[:, :5].mean(axis=1).astype(float)
-        orb["vis_opp_median"] = np.median(V_opp, axis=1).astype(float)
-        orb["vis_opp_min"] = V_opp.min(axis=1).astype(float)
-        orb["vis_opp_max"] = V_opp.max(axis=1).astype(float)
+        # Number of solved apparitions inside the lookback window. This is the
+        # honest replacement for what the V=28 sentinel used to smuggle into
+        # vis_opp_mean: roughly (lookback / synodic period), i.e. how many
+        # opportunities the survey era offered at all.
+        orb["n_valid_apparitions"] = (~stale).sum(axis=1).astype(float)
+
+        # Soft count of detectable apparitions: sum over in-window events of a
+        # logistic P(detect | V) centred on V = 21.5 mag with 0.5 mag width. A
+        # direct physical estimate of how many apparitions a typical survey
+        # could have caught; the limit and width were chosen on held-out data.
+        SOFT_DET_LIMIT, SOFT_DET_WIDTH = 21.5, 0.5
+        with np.errstate(over="ignore", invalid="ignore"):
+            p_det = 1.0 / (1.0 + np.exp(-(SOFT_DET_LIMIT - V_opp_clean) / SOFT_DET_WIDTH))
+        orb["vis_opp_soft_detect"] = np.nansum(p_det, axis=1).astype(float)
+
+        # Trend of apparition brightness across the 17 events (mag per event,
+        # positive = getting fainter toward the present), least-squares slope
+        # over in-window events only.
+        j_idx = np.arange(N_OPP, dtype=np.float64)[None, :].repeat(V_opp.shape[0], axis=0)
+        j_idx = np.where(stale, np.nan, j_idx)
+        with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            j_mean = np.nanmean(j_idx, axis=1, keepdims=True)
+            v_mean = np.nanmean(V_opp_clean, axis=1, keepdims=True)
+            cov_jv = np.nansum((j_idx - j_mean) * (V_opp_clean - v_mean), axis=1)
+            var_j = np.nansum((j_idx - j_mean) ** 2, axis=1)
+            orb["vis_opp_slope"] = (cov_jv / np.where(var_j > 0, var_j, np.nan)).astype(float)
+
+        # Further apparition-vs-orbit contrasts that tested as marginally helpful
+        # on their own (each +0.1-0.3% held-out Poisson deviance vs the 14-feature
+        # paper model on 200k rows) but were eliminated by backward selection
+        # because vis_opp_minus_orbit / vis_opp_soft_detect carry the same
+        # information. Kept for future experiments; see
+        # modeling/tabprep_discovery/REPORT.md for the numbers.
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            # brightest in-window apparition minus orbit-average: single best recovery chance
+            orb["vis_oppmin_minus_orbit"] = (np.nanmin(V_opp_clean, axis=1) - vis_orbit).astype(float)
+            # flux-mean (rather than magnitude-mean) apparition brightness minus orbit-average;
+            # weights bright apparitions more heavily. vis_opp_fluxsum is defined below, so this
+            # is filled in after it is computed.
+            # fraction of in-window apparitions brighter than V = 21
+            n_valid_safe = np.maximum(orb["n_valid_apparitions"].to_numpy(dtype=np.float64), 1.0)
+            orb["vis_opp_bright_frac"] = (np.nansum(V_opp_clean < 21.0, axis=1) / n_valid_safe).astype(float)
+        # brightness at the last perihelion passage minus orbit-average (matters for high-e objects)
+        orb["vis_lastperi_minus_orbit"] = (orb["vis_last_perihelion"].to_numpy(dtype=np.float64) - vis_orbit).astype(float)
+
+        # ======================================================================
+        # FEATURE SETS FOUND IN THE 2026-09 FEATURE-ENGINEERING SEARCH
+        # (LightGBM, paired 5-fold CV on the full ~1.37M-row training frame;
+        # gains are relative to the 14-feature set used in the paper. Notebook
+        # mlcols lists are the place to enable these.)
+        #
+        # Paper (15 columns, two new): paper 14 minus 'e', plus
+        #   'vis_opp_minus_orbit', 'perihelion_delta_true'
+        #   -> Poisson deviance -1.95%, binary log-loss -0.87%
+        #
+        # Best 14-column set (four new, keeps vis_orbit_mag_multi):
+        #   ['H','Node','a','i','vis_mid','vis_q','vis_orbit_mag_multi','vis_opp_mean',
+        #    'Perihelion_direction_x_e','Perihelion_direction_y_e',
+        #    'vis_opp_minus_orbit','vis_opp5_minus_opp17','vis_opp_soft_detect','perihelion_delta_true']
+        #   -> Poisson deviance -2.75%, binary log-loss -0.67%
+        #
+        # BEST SET EVER FOUND (16 columns, unconstrained backward elimination from
+        # 30 candidates; drops e, vis_opp_mean, dec_flux_weighted,
+        # spatial_discoverability_fraction from the paper set):
+        #   ['H','Node','a','i','vis_mid','vis_q','vis_timeavg','vis_orbit_mag_multi',
+        #    'Perihelion_direction_x_e','Perihelion_direction_y_e',
+        #    'vis_opp_minus_orbit','vis_opp5_minus_opp17','vis_opp_soft_detect',
+        #    'perihelion_delta_true','vis_opp_slope','n_valid_apparitions']
+        #   -> Poisson deviance -3.25%, binary log-loss -1.08%
+        #   17 columns (+ dec_flux_weighted) was no better; 15 (- vis_opp5_minus_opp17) cost 0.45%.
+        # ======================================================================
 
         # Count of how many of the N_OPP solved apparitions reached a "clearly
         # bright" apparent magnitude (V < VIS_OPP_BRIGHT_MAG). Linkage is a
         # best-of-N process, so the *number* of times an object was bright enough
         # to be detected is a more direct observability signal than the mean
-        # brightness alone. Stale out-of-window events carry the faint sentinel
-        # (V=28) and so never count toward this total.
+        # brightness alone. Stale out-of-window events are NaN in V_opp_clean
+        # and so never count toward this total.
         VIS_OPP_BRIGHT_MAG = 21.0
-        orb["opp_bright_count"] = (V_opp < VIS_OPP_BRIGHT_MAG).sum(axis=1).astype(float)
+        with np.errstate(invalid="ignore"):
+            orb["opp_bright_count"] = np.nansum(
+                V_opp_clean < VIS_OPP_BRIGHT_MAG, axis=1
+            ).astype(float)
 
         # ====================================================================
         # EXPERIMENTAL vis_opp VARIANTS (do not modify vis_opp_mean itself)
@@ -1461,7 +1526,7 @@ def feature_engineering(orb):
         #       flux (-2.5 log10 of the mean flux) instead is a smooth
         #       "brightest apparition" that rewards bright outliers the mean
         #       throws away (Jensen gap). It is brighter than vis_opp_mean and
-        #       sits between vis_opp_mean and vis_opp_min.
+        #       sits between vis_opp_mean and the brightest in-window apparition.
         #
         #   (B) observability dilution (the _disc suffix). vis_opp_mean is a
         #       pure brightness term with no notion of how OFTEN the object is
@@ -1479,12 +1544,18 @@ def feature_engineering(orb):
             )
         )
 
-        # (A) flux-domain mean of the five apparition fluxes, back in mag.
-        # Floor the mean flux at 1e-30 (V ~= 75) to keep log10 finite; the
-        # stale-event sentinel (V=28) already contributes negligible flux.
-        flux_opp_mean = np.power(10.0, -0.4 * V_opp).mean(axis=1)
-        vis_opp_fluxsum = -2.5 * np.log10(np.maximum(flux_opp_mean, 1e-30))
+        # (A) flux-domain mean of the in-window apparition fluxes, back in mag.
+        # Floor the mean flux at 1e-30 (V ~= 75) to keep log10 finite. Stale
+        # out-of-window events are NaN and drop out of the mean entirely, so an
+        # object with no usable apparition yields NaN rather than a magnitude
+        # built from the meaningless fixed-element reconstruction.
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            flux_opp_mean = np.nanmean(np.power(10.0, -0.4 * V_opp_clean), axis=1)
+            vis_opp_fluxsum = -2.5 * np.log10(np.maximum(flux_opp_mean, 1e-30))
         orb["vis_opp_fluxsum"] = vis_opp_fluxsum.astype(float)
+        # flux-mean apparition brightness minus orbit-average (see contrasts block above)
+        orb["vis_oppflux_minus_orbit"] = (vis_opp_fluxsum - vis_orbit).astype(float)
 
         # (B) discoverability-diluted variants of the two brightness terms.
         orb["vis_opp_mean_disc"] = (
@@ -1497,13 +1568,17 @@ def feature_engineering(orb):
         orb["perihelion_dec_true"] = np.nan
         orb["vis_2nd_last_perihelion"] = np.nan
         orb["vis_3rd_last_perihelion"] = np.nan
-        for j in range(17):
-            orb[f"vis_opp_{j + 1}"] = np.nan
         orb["vis_opp_mean"] = np.nan
-        orb["vis_opp_mean_5"] = np.nan
-        orb["vis_opp_median"] = np.nan
-        orb["vis_opp_min"] = np.nan
-        orb["vis_opp_max"] = np.nan
+        orb["vis_opp_minus_orbit"] = np.nan
+        orb["vis_opp5_minus_orbit"] = np.nan
+        orb["vis_opp5_minus_opp17"] = np.nan
+        orb["n_valid_apparitions"] = np.nan
+        orb["vis_opp_soft_detect"] = np.nan
+        orb["vis_opp_slope"] = np.nan
+        orb["vis_oppmin_minus_orbit"] = np.nan
+        orb["vis_opp_bright_frac"] = np.nan
+        orb["vis_lastperi_minus_orbit"] = np.nan
+        orb["vis_oppflux_minus_orbit"] = np.nan
         orb["opp_bright_count"] = np.nan
         orb["vis_opp_fluxsum"] = np.nan
         orb["vis_opp_mean_disc"] = np.nan
@@ -1521,6 +1596,237 @@ def feature_engineering(orb):
         ).astype(float)
     else:
         orb["desig_year"] = np.nan
+
+    orb = add_survey_era_features(orb)
+
+    return orb
+
+
+# ==============================================================================
+# SURVEY-ERA APPARITION FEATURES
+# ==============================================================================
+# A self-contained block that solves the apparitions of the modern survey era (1998 onward) and
+# derives five features. It deliberately does NOT reuse the vis_opp_* machinery above: that solver
+# returns 17 apparitions with magnitudes only, while these features need 25 apparitions (28 yr at a
+# typical MBA synodic period) together with each apparition's SKY POSITION, which the older code
+# discards. Leaving the two paths separate keeps the published vis_opp_* columns bit-for-bit
+# unchanged.
+#
+# Features produced:
+#   gal_lat_frac_low     fraction of apparitions within 15 deg of the galactic plane
+#   days_since_last_opp  days from the most recent apparition to the catalogue epoch
+#   first_det_year       calendar year of the first apparition to beat its era's limiting magnitude
+#   E_full_w03           expected number of observed apparitions (the analytical detection model)
+#   E_var                Poisson-binomial variance of that same expectation
+#
+# See modeling/tabprep_discovery/REPORT.md for the selection evidence and the literature behind the
+# constants (Tricarico 2016 for survey depth; Denneau et al. 2013 for galactic-plane avoidance).
+
+_N_APPARITIONS = 25
+_LOOKBACK_DAYS = 20.0 * 365.25      # must match the validated configuration; do not change casually
+_SURVEY_START_YEAR = 1998.0
+_ERA_YEARS = (1998.0, 2005.0, 2012.0, 2020.0)
+_ERA_VLIM = (19.5, 20.5, 21.5, 22.0)
+_MAG_WIDTH = 0.3            # sharpness of the magnitude cutoff; sharp forms beat soft ones on held-out data
+_MAG_WIDTH_VAR = 0.7        # width used for E_var only - see the note where E_var is computed
+_GAL_HALF, _GAL_POW = 25.0, 2.0     # galactic-confusion half-point and exponent
+_DEC_SOUTH, _DEC_NORTH, _DEC_SOFT = -30.0, 70.0, 12.0   # declination coverage taper
+_EXP_SECONDS, _SEEING_ARCSEC = 30.0, 1.5                # trailing loss reference exposure/seeing
+_GAL_LOW_EDGE = 15.0        # "in the plane" threshold, in degrees
+_CONFUSION_FILES = ("bright2.pgm", os.path.join("modeling", "tabprep_discovery", "bright2.pgm"))
+_RA_NGP, _DEC_NGP = np.radians(192.85948), np.radians(27.12825)
+_confusion_cache = {}
+
+
+def _load_confusion_map():
+    """Gaia-DR2 'galactic confusion' map, as distributed with Find_Orb (Project Pluto).
+
+    Provenance: star_cats/bright.c sums Gaia DR2 stellar brightness in 0.1-deg squares (one count =
+    a mag-20 star); make_map.c byte-scales it with a cos(dec) normalisation; find_orb's ephem0.cpp
+    consumes it as galactic_confusion(). The RA/dec -> pixel convention below (note RA runs
+    BACKWARDS) reproduces that function exactly.
+    """
+    if "map" in _confusion_cache:
+        return _confusion_cache["map"]
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in _CONFUSION_FILES:
+        path = os.path.join(here, rel)
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as fh:
+            assert fh.readline().strip() == b"P5", f"{path} is not a binary PGM"
+            line = fh.readline()
+            while line.startswith(b"#"):
+                line = fh.readline()
+            xs, ys = (int(v) for v in line.split())
+            assert int(fh.readline().strip()) == 255
+            img = np.frombuffer(fh.read(xs * ys), dtype=np.uint8).reshape(ys, xs).astype(np.float32)
+        img = np.concatenate([img, img[:, :1]], axis=1)     # wrap column for interpolation at RA=360
+        _confusion_cache["map"] = (img, xs, ys)
+        return _confusion_cache["map"]
+    _confusion_cache["map"] = None
+    return None
+
+
+def _galactic_confusion(ra_deg, dec_deg):
+    """Bilinearly interpolated confusion value (0-255). Returns NaN if the map is unavailable."""
+    m = _load_confusion_map()
+    if m is None:
+        return np.full(np.shape(ra_deg), np.nan)
+    img, xs, ys = m
+    ra = np.mod(np.asarray(ra_deg, dtype=np.float64), 360.0)
+    dec = np.clip(np.asarray(dec_deg, dtype=np.float64), -90.0, 90.0)
+    x = np.mod((720.0 - ra) * xs / 360.0 - 0.5, xs)
+    y = np.clip((90.0 - dec) * ys / 180.0 - 0.5, 0.0, ys - 1.000001)
+    ix = x.astype(np.int64); iy = y.astype(np.int64)
+    fx = x - ix; fy = y - iy
+    iy1 = np.minimum(iy + 1, ys - 1)
+    return (img[iy, ix] * (1 - fx) * (1 - fy) + img[iy, ix + 1] * fx * (1 - fy)
+            + img[iy1, ix] * (1 - fx) * fy + img[iy1, ix + 1] * fx * fy)
+
+
+def _solve_apparitions(orb, n_opp=_N_APPARITIONS):
+    """Times and sky positions of the n_opp most recent apparitions, relative to the MPCORB epoch.
+
+    Opposition times come from a linear mean-longitude estimate refined by Newton iteration on the
+    true ecliptic longitude difference. The most recent apparition is bracketed to lie at or before
+    the epoch, and validity is TWO-SIDED (inside the lookback window and not in the future); a
+    one-sided guard leaves roughly half of all objects with apparitions dated after the epoch.
+    """
+    f = lambda c: orb[c].to_numpy(dtype=np.float64)
+    a, e = f("a"), f("e")
+    inc, node, peri = np.radians(f("i")), np.radians(f("Node")), np.radians(f("Peri"))
+    M0, epoch, H = np.radians(f("M")), f("Epoch"), f("H")
+    n_mm = np.sqrt(0.0002959122082855911) / np.power(np.maximum(a, 1e-9), 1.5)
+    n_earth = 2.0 * np.pi / 365.256
+
+    def earth_xy(t):
+        T = (t - 2451545.0) / 36525.0
+        M = np.radians(357.52911 + 35999.05029 * T)
+        lam = (np.radians(280.46646 + 36000.76983 * T)
+               + 0.033416 * np.sin(M) + 0.000349 * np.sin(2.0 * M)) + np.pi
+        r = 1.00014061 - 0.01670861 * np.cos(M) - 0.00013957 * np.cos(2.0 * M)
+        return r * np.cos(lam), r * np.sin(lam), lam
+
+    def ast_xyz(t, A, E_, I_, O_, W_, M_, EP, N_):
+        MM = np.mod(M_ + N_ * (t - EP) + np.pi, 2.0 * np.pi) - np.pi
+        EA = MM + E_ * np.sin(MM)
+        for _ in range(12):
+            EA = EA - (EA - E_ * np.sin(EA) - MM) / np.maximum(1.0 - E_ * np.cos(EA), 1e-12)
+        nu = 2.0 * np.arctan2(np.sqrt(1 + E_) * np.sin(EA / 2), np.sqrt(1 - E_) * np.cos(EA / 2))
+        r = A * (1.0 - E_ * np.cos(EA))
+        u = W_ + nu
+        cu, su, ci, si, cO, sO = np.cos(u), np.sin(u), np.cos(I_), np.sin(I_), np.cos(O_), np.sin(O_)
+        return (r * (cO * cu - sO * su * ci), r * (sO * cu + cO * su * ci), r * su * si, r)
+
+    rel = n_mm - n_earth
+    rel = np.where(np.abs(rel) < 1e-6, np.sign(rel + 1e-12) * 1e-6, rel)
+    _, _, lam_e0 = earth_xy(epoch)
+    d0 = np.mod(np.mod(node + peri + M0, 2 * np.pi) - lam_e0 + np.pi, 2 * np.pi) - np.pi
+    S_syn = np.abs(2.0 * np.pi / rel)
+    t_last = epoch - d0 / rel
+    t_last = t_last - np.ceil((t_last - epoch) / S_syn) * S_syn      # force to at-or-before the epoch
+    t = t_last[:, None] - np.arange(n_opp)[None, :] * S_syn[:, None]
+
+    B = lambda v: v[:, None] * np.ones((1, n_opp))
+    for _ in range(4):
+        x, y, z, _r = ast_xyz(t, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
+        _, _, lam_e = earth_xy(t)
+        t = t - (np.mod(np.arctan2(y, x) - lam_e + np.pi, 2 * np.pi) - np.pi) / B(rel)
+
+    x, y, z, r = ast_xyz(t, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
+    xe, ye, _ = earth_xy(t)
+    dx, dy, dz = x - xe, y - ye, z
+    delta = np.sqrt(dx * dx + dy * dy + dz * dz)
+    obl = np.radians(23.439291)
+    y_eq = dy * np.cos(obl) - dz * np.sin(obl)
+    z_eq = dy * np.sin(obl) + dz * np.cos(obl)
+    dec = np.arcsin(np.clip(z_eq / np.maximum(delta, 1e-12), -1, 1))
+    ra = np.arctan2(y_eq, dx)
+    gal_b = np.arcsin(np.clip(np.sin(dec) * np.sin(_DEC_NGP)
+                              + np.cos(dec) * np.cos(_DEC_NGP) * np.cos(ra - _RA_NGP), -1, 1))
+    cos_alpha = np.clip((x * dx + y * dy + z * dz) / np.maximum(r * delta, 1e-12), -1, 1)
+    V = (H[:, None] + 5.0 * np.log10(np.maximum(r * delta, 1e-12))
+         - 2.5 * np.log10(hg_phase(np.arccos(cos_alpha))))
+
+    # sky-plane rate: angular motion of the geocentric direction over one day, for trailing loss
+    x2, y2, z2, _ = ast_xyz(t + 1.0, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
+    xe2, ye2, _ = earth_xy(t + 1.0)
+    u1 = np.stack([dx, dy, dz], 0)
+    u2 = np.stack([x2 - xe2, y2 - ye2, z2], 0)
+    u1 = u1 / np.maximum(np.linalg.norm(u1, axis=0), 1e-12)
+    u2 = u2 / np.maximum(np.linalg.norm(u2, axis=0), 1e-12)
+    rate = np.degrees(np.arccos(np.clip((u1 * u2).sum(0), -1, 1)))
+
+    age = epoch[:, None] - t
+    valid = (age <= _LOOKBACK_DAYS) & (age >= -1.0)
+    return dict(t=t, V=V, dec=np.degrees(dec), gal_b=np.degrees(gal_b), rate=rate,
+                ra=np.mod(np.degrees(ra), 360.0), valid=valid, epoch=epoch)
+
+
+def _era_limiting_magnitude(year):
+    out = np.where(year >= _ERA_YEARS[0], _ERA_VLIM[0], np.nan)
+    for yr, vl in zip(_ERA_YEARS[1:], _ERA_VLIM[1:]):
+        out = np.where(year >= yr, vl, out)
+    return out
+
+
+def add_survey_era_features(orb):
+    """Adds the five survey-era apparition features. Safe to call on any orbit frame."""
+    needed = ("a", "e", "i", "Node", "Peri", "M", "Epoch", "H")
+    if not all(c in orb.columns for c in needed):
+        for c in ("gal_lat_frac_low", "days_since_last_opp", "first_det_year", "E_full_w03", "E_var"):
+            orb[c] = np.nan
+        return orb
+
+    G = _solve_apparitions(orb)
+    ok = G["valid"]
+    year = 2000.0 + (G["t"] - 2451545.0) / 365.25
+    in_era = ok & (year >= _SURVEY_START_YEAR)
+    n_ok = np.maximum(ok.sum(axis=1), 1)
+    nan_if = lambda A: np.where(ok, A, np.nan)
+
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        abs_b = np.abs(nan_if(G["gal_b"]))
+        orb["gal_lat_frac_low"] = (np.nansum(abs_b < _GAL_LOW_EDGE, axis=1) / n_ok).astype(float)
+
+        has_any = ok.any(axis=1)
+        t_last = np.where(has_any, np.nanmax(np.where(ok, G["t"], -np.inf), axis=1), np.nan)
+        orb["days_since_last_opp"] = np.where(has_any, G["epoch"] - t_last, np.nan).astype(float)
+
+        V = nan_if(G["V"])
+        margin = _era_limiting_magnitude(year) - V
+        detectable = np.where(in_era, margin > 0, False)
+        any_det = detectable.sum(axis=1) > 0
+        orb["first_det_year"] = np.where(
+            any_det, np.nanmin(np.where(detectable, year, np.nan), axis=1), np.nan).astype(float)
+
+        # --- the analytical detection model: a PRODUCT of independent factors, summed ---
+        # A boosted tree splits one column at a time and cannot form products, so supplying the
+        # product explicitly is what makes this worth more than its ingredients separately.
+        conf = np.where(in_era, _galactic_confusion(G["ra"], G["dec"]), np.nan)
+        p_mag = 1.0 / (1.0 + np.exp(-np.clip(margin / _MAG_WIDTH, -30, 30)))
+        p_gal = 1.0 / (1.0 + np.power(np.maximum(conf, 0.0) / _GAL_HALF, _GAL_POW))
+        dec_a = nan_if(G["dec"])
+        p_dec = np.clip(
+            (1.0 / (1.0 + np.exp(-(dec_a - _DEC_SOUTH) / _DEC_SOFT)))
+            * (1.0 / (1.0 + np.exp((dec_a - _DEC_NORTH) / _DEC_SOFT))), 0.0, 1.0)
+        trail_mag = 2.5 * np.log10(np.maximum(
+            1.0 + nan_if(G["rate"]) * 3600.0 * _EXP_SECONDS / 86400.0 / _SEEING_ARCSEC, 1.0))
+        p_trail = np.power(10.0, -0.4 * np.maximum(trail_mag, 0.0))
+        p = np.where(in_era & np.isfinite(p_gal),
+                     np.clip(p_mag * p_gal * p_dec * p_trail, 0.0, 1.0), 0.0)
+        orb["E_full_w03"] = p.sum(axis=1).astype(float)
+
+        # E_var deliberately uses the WIDER magnitude cutoff (_MAG_WIDTH_VAR), not the sharp one above.
+        # That asymmetry is not principled - it is how the validated variant happened to be generated -
+        # but it is what the +9.33% holdout result was measured with, so it is reproduced exactly here.
+        # A consistent-width variance is worth testing before any future change.
+        p_mag_v = 1.0 / (1.0 + np.exp(-np.clip(margin / _MAG_WIDTH_VAR, -30, 30)))
+        p_v = np.where(in_era & np.isfinite(p_gal),
+                       np.clip(p_mag_v * p_gal * p_dec * p_trail, 0.0, 1.0), 0.0)
+        orb["E_var"] = (p_v * (1.0 - p_v)).sum(axis=1).astype(float)
 
     return orb
 
