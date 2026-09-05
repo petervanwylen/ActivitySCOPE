@@ -116,3 +116,4 @@ Object,reason
 2003 QK81,PyRoOrb likely mislinkage: [mag1.09] MAG dH=1.09 p=0.0146
 2016 EU381,PyRoOrb likely mislinkage: [ramp1.01+drop0.05] RAMP 2.0sig in Dec = 4.6x the rest
 2025 FW29,PyRoOrb likely mislinkage: [drop1.02+z0.01] DROP 1.82x
+2014 HA660, multiopp mislinkage
