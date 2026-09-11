@@ -3,3 +3,4 @@ sbpy
 matplotlib
 statsmodels
 shap
+psycopg2-binary

@@ -15,6 +15,7 @@ import shutil
 import time
 import warnings
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import numpy as np
 from sbpy.data import Names
@@ -496,7 +497,7 @@ def add_training_targets(orb, num_opps_threshold=4):
 # FEATURE ENGINEERING
 # ==============================================================================
 
-def feature_engineering(orb):
+def feature_engineering(orb, extra_features=False):
     """
     Engineer predictive features from orbital elements.
     
@@ -507,6 +508,17 @@ def feature_engineering(orb):
     ----------
     orb : pd.DataFrame
         Orbit dataframe with at least columns: a, e, i, H, Peri, Node
+    extra_features : bool, default False
+        Also compute the exploratory / superseded feature families that the 12-feature model
+        does not use -- the orbit-averaged block (vis_orbit_mag_multi,
+        spatial_discoverability_fraction, dec_flux_weighted, vis_orbit_flux_*, ...), the
+        last-three-perihelia reconstruction, the 17-apparition vis_opp_* solver,
+        n_detect_windows, and the survey-era block (E_50yr, E_var, E_full_w03, first_det_year,
+        gal_lat_frac_low, ...) apart from its one surviving column, days_since_last_opp.
+        Together they are the great majority of this function's runtime (n_detect_windows
+        alone is most of it), so they are off by default; see
+        _add_orbit_averaged_features, _add_exploratory_features, add_detect_window_features
+        and add_survey_era_features. Turning this on reproduces their values unchanged.
     
     Returns
     -------
@@ -543,6 +555,16 @@ def feature_engineering(orb):
     delta_timeavg = np.maximum(delta_geom - d_timeavg, eps_val)
     orb['vis_timeavg'] = (5.0 * np.log10(np.maximum(r_timeavg, eps_val) * delta_timeavg) + H).astype(float)
 
+    # vis_a: exactly vis_q's formula evaluated at r = a instead of r = q -- the idealized
+    # opposition magnitude at the mean distance, with Delta = a - 1 au. Earlier versions used the
+    # geometric mean of the opposition and conjunction distances, sqrt(a^2 - 1), less an offset of
+    # 1 au; that offset had no geometric meaning, and removing it costs nothing measurable
+    # (+0.067% Poisson deviance, 95% CI [+0.008%, +0.130%], and -0.030% log-loss, on 1.17M rows
+    # held out from a 200k training subsample). The a - 1 form also needs no absolute value, so it
+    # stays defined for interior objects the same way vis_q does.
+    delta_a = np.maximum(a - 1.0, eps_val)
+    orb['vis_a'] = (5.0 * np.log10(np.maximum(a, eps_val) * delta_a) + H).astype(float)
+
     # vis_typ
     d_vis_typ = 0.51
     r_vis_typ = a * (1.0 + e / 2.0)
@@ -566,7 +588,7 @@ def feature_engineering(orb):
     #
     # Delta = r - d uses d = 1 (Earth at 1 AU, opposition geometry) for both,
     # matching vis_flux and introducing no fitted parameter; d can be refit per
-    # feature like the siblings (vis_timeavg=0.9, vis_typ=0.51, vis_q=0.8) if
+    # feature like the siblings (vis_timeavg=0.9, vis_typ=0.51) if
     # desired.
     d_alt = 1.0
 
@@ -590,10 +612,13 @@ def feature_engineering(orb):
     orb['vis_mid'] = (5.0 * np.log10(np.maximum(r_mid, eps_val) * delta_mid) + H).astype(float)
     # ------------------------------------------------------------------------
 
-    # vis_q
-    d_vis_q = 0.8
+    # vis_q: perihelion viewed at idealized opposition (Delta = q - 1), no fitted
+    # constant. Replaces vis_mid in the paper feature set (-0.15% deviance, -0.11%
+    # log-loss, paired 5-fold on the full training frame). An earlier version used a
+    # tuned offset of 0.8 au instead of 1; it was measurably worse (+0.4% deviance)
+    # and has been removed.
     r_vis_q = a * (1.0 - e)
-    delta_vis_q = np.maximum(r_vis_q - d_vis_q, eps_val)
+    delta_vis_q = np.maximum(r_vis_q - 1.0, eps_val)
     orb['vis_q'] = (5.0 * np.log10(np.maximum(r_vis_q, eps_val) * delta_vis_q) + H).astype(float)
 
     # vis_inc_old
@@ -680,6 +705,15 @@ def feature_engineering(orb):
     orb["Perihelion_direction_x_e"] = orb["Perihelion_direction_x"] * orb["e"]
     orb["Perihelion_direction_y_e"] = orb["Perihelion_direction_y"] * orb["e"]
     orb["Perihelion_direction_z_e"] = orb["Perihelion_direction_z"] * orb["e"]
+
+    # Coplanar eccentricity-vector components: e*cos(varpi), e*sin(varpi) with
+    # varpi = Node + Peri the longitude of perihelion. This is Perihelion_direction_{x,y}_e
+    # with the cos(i) correction dropped; performance is indistinguishable on the
+    # full training frame (-0.03% deviance, +0.10% log-loss, neither significant)
+    # and the definition is a single line.
+    varpi_rad = np.radians(orb["Node"] + orb["Peri"])
+    orb["e_cos_varpi"] = orb["e"] * np.cos(varpi_rad)
+    orb["e_sin_varpi"] = orb["e"] * np.sin(varpi_rad)
     
     # Declination of perihelion
     # Accounts for northern vs southern hemisphere observational bias
@@ -710,12 +744,67 @@ def feature_engineering(orb):
     # Combined angular elements (exploratory feature)
     orb["node_plus_peri"] = (orb["Node"] + orb["Peri"]) % 360
     
+    # The orbit-averaged block and the exploratory / superseded families (last-perihelia and the
+    # 17-apparition vis_opp_* block) are all opt-in: the 12-feature model uses none of their
+    # columns. See _add_orbit_averaged_features and _add_exploratory_features.
+    if extra_features:
+        orb = _add_orbit_averaged_features(orb)
+        orb = _add_exploratory_features(orb)
+
+    if "Principal_desig" in orb.columns:
+        # Palomar-Leiden ("2060 P-L") and Trojan-survey ("4020 T-2")
+        # designations have the same shape as a year but are not one, so require
+        # a genuine provisional designation: 4-digit year, space, two letters.
+        orb["desig_year"] = pd.to_numeric(
+            orb["Principal_desig"].astype("string").str.extract(
+                r"^((?:1[89]|20)\d{2})\s+[A-Z]{2}", expand=False
+            ),
+            errors="coerce",
+        ).astype(float)
+    else:
+        orb["desig_year"] = np.nan
+
+    # Every apparition-derived block below wants the same reconstructed apparitions, so they are
+    # solved once here and sliced: add_survey_era_features scores apparitions 0..24 and 25..59,
+    # add_detectable_apparition_features all 60. Solving once is bit-identical to the separate
+    # solves (see _slice_apparitions) and removes a full duplicate of the solver's work.
+    G, t_ref = _shared_apparition_solve(orb)
+    if extra_features:
+        # The survey-era block (E_50yr, E_var, E_full_w03, first_det_year, gal_lat_frac_low, ...)
+        # was superseded by the detectable-apparition features below; only days_since_last_opp
+        # survived into the model, and add_last_opposition_feature computes that alone.
+        orb = add_survey_era_features(orb, G=G, t_ref=t_ref)
+        # n_detect_windows walks the whole 20-yr lookback on a 10-day grid rather than scoring
+        # solved apparitions, which makes it several times more expensive than everything else in
+        # this function put together. It is not in the model feature list either.
+        orb = add_detect_window_features(orb)
+    else:
+        orb = add_last_opposition_feature(orb, G=G, t_ref=t_ref)
+    orb = add_detectable_apparition_features(orb, G=G, t_ref=t_ref)
+
+    return orb
+
+
+def _add_orbit_averaged_features(orb):
+    """Orbit-averaged discoverability features on a 32-true-anomaly x 24-Earth-longitude grid:
+    vis_orbit_mag_multi and its by-products spatial_discoverability_fraction, dec_flux_weighted,
+    dec_orbit_min, frac_flux_south30, vis_orbit_flux_opp, vis_orbit_flux_multi.
+
+    Its row chunks run on a thread pool (numpy releases the GIL); every row is independent, so
+    the output is identical to the sequential loop. The 12-feature model uses none of these
+    columns, so feature_engineering runs this block only under extra_features=True.
+    """
+    a = orb['a']
+    e = np.clip(orb['e'], 0, 0.999)
+    H = orb['H']
+    eps_val = 1e-3
+
     # ============================================================================
     # ORBIT-AVERAGED FEATURES
     # ============================================================================
     
     N_ANOMALY_SAMPLES = 32
-    ANOMALY_CHUNK_SIZE = 100_000
+    ANOMALY_CHUNK_SIZE = 20_000   # per thread; the block is run chunk-parallel (bit-identical, rows are independent)
     N = len(orb)
     Node_rad = np.radians(orb["Node"].to_numpy(dtype=np.float64))
     Peri_rad = np.radians(orb["Peri"].to_numpy(dtype=np.float64))
@@ -811,8 +900,7 @@ def feature_engineering(orb):
     H_np = orb['H'].to_numpy(dtype=np.float64)
     r_t_np = a_np * (1.0 + e_np ** 2 / 2.0)
 
-    for start in range(0, N, ANOMALY_CHUNK_SIZE):
-        end = min(start + ANOMALY_CHUNK_SIZE, N)
+    def _orbit_chunk(start, end):
         a_c = a_np[start:end, None]
         e_c = e_np[start:end, None]
         Node_c = Node_rad[start:end, None]
@@ -1077,6 +1165,8 @@ def feature_engineering(orb):
         duty_penalty = -2.5 * np.log10(np.maximum(duty_fraction, DUTY_FLOOR))
         vis_orbit_mag_multi_arr[start:end] = mag_when_obs + duty_penalty
 
+    _run_row_chunks(_orbit_chunk, N, ANOMALY_CHUNK_SIZE)
+
     # orb["mean_opp_dec"] = mean_opp_dec_arr.astype(float)
     orb["spatial_discoverability_fraction"] = spatial_disc_arr.astype(float)
     orb["dec_flux_weighted"] = dec_flux_weighted_arr.astype(float)
@@ -1087,6 +1177,39 @@ def feature_engineering(orb):
     orb["vis_orbit_flux_multi"] = vis_orbit_flux_multi_arr.astype(float)
     # orb["vis_orbit_mag_multi_old"] = vis_orbit_mag_multi_old_arr.astype(float)
     orb["vis_orbit_mag_multi"] = vis_orbit_mag_multi_arr.astype(float)
+
+    return orb
+
+
+def _add_exploratory_features(orb):
+    """Adds the exploratory / superseded feature families that the current model does not use:
+
+      * the last-three-perihelia reconstruction (vis_last_perihelion, perihelion_delta_true,
+        perihelion_dec_true, vis_2nd_last_perihelion, vis_3rd_last_perihelion);
+      * the 17-apparition equal-longitude solver and everything derived from it (the vis_opp_*
+        family, n_valid_apparitions, opp_bright_count).
+
+    Both depend on the orbit-averaged block, which is computed first if it is not already
+    present. None of these appear in the notebook's current mlcols; they are kept because the
+    demo notebook, shap_simple.py and sfs_neo.py still refer to them and because they are the
+    pool a future feature search would select from, so feature_engineering(orb,
+    extra_features=True) brings them all back unchanged.
+    """
+    if "vis_orbit_mag_multi" not in orb.columns:
+        orb = _add_orbit_averaged_features(orb)
+    a = orb['a']
+    e = np.clip(orb['e'], 0, 0.999)
+    H = orb['H']
+    eps_val = 1e-3
+    # Plain arrays of the elements, as the orbit-averaged block defines them (this function was
+    # split out of the same monolithic routine and kept using its names).
+    a_np = orb['a'].to_numpy(dtype=np.float64)
+    e_np = np.clip(orb['e'].to_numpy(dtype=np.float64), 0.0, 0.999)
+    i_np = np.radians(orb['i'].to_numpy(dtype=np.float64))
+    H_np = orb['H'].to_numpy(dtype=np.float64)
+    Node_rad = np.radians(orb["Node"].to_numpy(dtype=np.float64))
+    Peri_rad = np.radians(orb["Peri"].to_numpy(dtype=np.float64))
+    HG_A1, HG_B1, HG_A2, HG_B2, HG_G, PHI_FLOOR = _HG_A1, _HG_B1, _HG_A2, _HG_B2, _HG_G, _PHI_FLOOR
 
     # ============================================================================
     # ALIGNMENT AT LAST PERIHELION
@@ -1345,6 +1468,10 @@ def feature_engineering(orb):
 
         # (1) Linear initial guesses for the five most recent equal-longitude
         #     apparitions <= Epoch.
+        # NOTE: this superseded solver is still anchored to the PER-OBJECT Epoch, which is the bug
+        # the reference-date machinery above exists to avoid (see _reference_epoch). It is kept that
+        # way deliberately so the published vis_opp_* values stay bit-identical; none of these
+        # columns is in the model. Anything reusing this path should switch to _solve_apparitions.
         varpi = Node_rad + Peri_rad
         psi_E = _wrap_pi((varpi + M0) - _earth_lon(Epoch_jd))
         t_near = Epoch_jd - psi_E / n_syn_safe
@@ -1584,21 +1711,6 @@ def feature_engineering(orb):
         orb["vis_opp_mean_disc"] = np.nan
         orb["vis_opp_fluxsum_disc"] = np.nan
 
-    if "Principal_desig" in orb.columns:
-        # Palomar-Leiden ("2060 P-L") and Trojan-survey ("4020 T-2")
-        # designations have the same shape as a year but are not one, so require
-        # a genuine provisional designation: 4-digit year, space, two letters.
-        orb["desig_year"] = pd.to_numeric(
-            orb["Principal_desig"].astype("string").str.extract(
-                r"^((?:1[89]|20)\d{2})\s+[A-Z]{2}", expand=False
-            ),
-            errors="coerce",
-        ).astype(float)
-    else:
-        orb["desig_year"] = np.nan
-
-    orb = add_survey_era_features(orb)
-
     return orb
 
 
@@ -1614,28 +1726,127 @@ def feature_engineering(orb):
 #
 # Features produced:
 #   gal_lat_frac_low     fraction of apparitions within 15 deg of the galactic plane
-#   days_since_last_opp  days from the most recent apparition to the catalogue epoch
-#   first_det_year       calendar year of the first apparition to beat its era's limiting magnitude
-#   E_full_w03           expected number of observed apparitions (the analytical detection model)
+#   days_since_last_opp  days from the most recent apparition to the reference date
+#   first_det_year       calendar year of the first apparition brighter than a fixed V = 21.5
+#   E_full_w03           expected number of observed apparitions (the analytical detection model, 20 yr)
+#   E_50yr               the same detection model over 50 yr with era limiting magnitudes back to 1976;
+#                        this is the column the model uses; E_var and days_since_last_detectable_E50yr
+#                        are built from the same 50-yr probabilities (E_full_w03 is reference only,
+#                        days_since_last_detectable_E50yr)
 #   E_var                Poisson-binomial variance of that same expectation
+#   days_since_last_detectable_E50yr  days from the most recent apparition with detection probability > 0.5 to the reference date
+#   year_brightest_app   calendar year of the brightest apparition in the window
+#   years_since_brightest_app  the same as an elapsed duration; this is the column the model uses
+#   n_detect_windows     number of separate detectable intervals in the window, from a 10-day time grid
+#                        (add_detect_window_features below; modeling/feature_eng2 final round: -0.28% deviance)
+#
+# The last two were added in the second feature-engineering round (modeling/feature_eng2/REPORT.md):
+# with orbital_period_sync they cut Poisson deviance by 1.5% on 1.17M held-out rows.
+#
+# Simplifications relative to the version first validated (modeling/feature_simplification/REPORT.md,
+# all paired 5-fold on the full training frame, none costing performance):
+#   * the never-populated 1998-2005 survey era is gone: with a 20-yr lookback every valid apparition
+#     is in the survey era, so the "survey-era subset" concept is dropped (exactly identical output
+#     for the current catalogue epoch);
+#   * first_det_year uses a fixed V = 21.5 instead of the era-dependent limit (-0.16% deviance);
+#   * the trailing-loss factor is dropped from the detection probability (-0.02% deviance);
+#   * E_var uses the same magnitude width as E_full_w03 instead of its own 0.7 (-0.20% deviance).
 #
 # See modeling/tabprep_discovery/REPORT.md for the selection evidence and the literature behind the
 # constants (Tricarico 2016 for survey depth; Denneau et al. 2013 for galactic-plane avoidance).
 
 _N_APPARITIONS = 25
 _LOOKBACK_DAYS = 20.0 * 365.25      # must match the validated configuration; do not change casually
-_SURVEY_START_YEAR = 1998.0
-_ERA_YEARS = (1998.0, 2005.0, 2012.0, 2020.0)
-_ERA_VLIM = (19.5, 20.5, 21.5, 22.0)
+_ERA_YEARS = (2012.0, 2020.0)       # survey-depth era boundaries ...
+_ERA_VLIM = (20.5, 21.5, 22.0)      # ... and limiting magnitudes: before 2012, 2012-2019, 2020 onward
+# E_50yr: the same detection model over the 50 years before the reference date. Extra apparitions solved
+# (on top of the 25 shared with the other features) and the era table extended back to 1976
+# (photographic surveys ~17.0, Spacewatch-era CCD ~18.5, LINEAR/NEAT ~19.5, then the table above).
+# The pre-2012 entries are approximate values consistent with the reported depths of the surveys of
+# each period, not figures taken from any single reference.
+_N_APPARITIONS_50 = 60
+_LOOKBACK_DAYS_50 = 50.0 * 365.25
+_ERA50_YEARS = (1976.0, 1990.0, 1998.0, 2005.0, 2012.0, 2020.0)
+_ERA50_VLIM = (17.0, 18.5, 19.5, 20.5, 21.5, 22.0)
+_FIRST_DET_VLIM = 21.5      # fixed threshold for first_det_year
 _MAG_WIDTH = 0.3            # sharpness of the magnitude cutoff; sharp forms beat soft ones on held-out data
-_MAG_WIDTH_VAR = 0.7        # width used for E_var only - see the note where E_var is computed
-_GAL_HALF, _GAL_POW = 25.0, 2.0     # galactic-confusion half-point and exponent
+# Galactic-confusion half-point and exponent. The half-point is overridable
+# from the environment so that the calibration in modeling/survey_efficiency
+# can be refitted against a different value of it: the measured eta_0, V_50, w
+# and f_dec are all conditional on the galactic term held fixed during the fit,
+# so the two cannot be varied independently.
+_GAL_HALF = float(os.environ.get("ACTIVITYSCOPE_GAL_HALF", 25.0))
+_GAL_POW = 2.0
 _DEC_SOUTH, _DEC_NORTH, _DEC_SOFT = -30.0, 70.0, 12.0   # declination coverage taper
-_EXP_SECONDS, _SEEING_ARCSEC = 30.0, 1.5                # trailing loss reference exposure/seeing
 _GAL_LOW_EDGE = 15.0        # "in the plane" threshold, in degrees
 _CONFUSION_FILES = ("bright2.pgm", os.path.join("modeling", "tabprep_discovery", "bright2.pgm"))
 _RA_NGP, _DEC_NGP = np.radians(192.85948), np.radians(27.12825)
 _confusion_cache = {}
+
+# --- the reference date: a single "now" for every object ---------------------------------------
+# All of these features ask a question that begins with "recently": how many apparitions in the last
+# 20 (or 50) years, how long since the last one, how long has it been detectable. "Recently" has to
+# be measured from somewhere, and it must be the SAME somewhere for every object, or the features
+# stop being comparable across the catalogue.
+#
+# It is tempting to use each object's own catalogue epoch, since that is the date its elements are
+# stated at -- and that is what this code originally did. But MPCORB restates almost every orbit to
+# a shared standard epoch, while short-arc single-opposition objects keep an epoch near their own
+# (single) observed arc. In the 2026-06 snapshot 9,879 of 1,561,163 objects carry a displaced epoch,
+# and 9,876 of those 9,879 are single-opposition -- i.e. essentially the entire candidate pool this
+# model exists to rank. Anchoring to the per-object epoch put their lookback window in, e.g.,
+# 1982-2002: the era table scored them against pre-survey depths, days_since_last_opp came out near
+# zero ("it only just had its chance"), and the model duly found nothing surprising about an object
+# seen once. That is a false negative on exactly the objects we are hunting, so the window, the
+# "days since" subtractions and the era clock are all anchored here instead.
+#
+# The per-object Epoch is still used, and must be, for its real job: propagating M0 to an arbitrary
+# time. Only the meaning of "now" is centralised.
+#
+# Resolution order: explicit set_reference_epoch() > ACTIVITYSCOPE_REFERENCE_EPOCH_JD > the latest
+# Epoch in the frame (the MPCORB standard epoch, since displaced epochs are always in the past;
+# verified on the snapshot, where the maximum and the mode are the same JD 2461200.5).
+_reference_epoch_override = None
+
+
+def set_reference_epoch(jd):
+    """Pin the date that the apparition features treat as "now" (a Julian date), or None to auto-detect.
+
+    Auto-detection takes the latest Epoch in the frame, which is the MPCORB standard epoch for any
+    full-catalogue frame. Set this explicitly when scoring a small frame that may not contain a
+    standard-epoch object -- a handful of freshly designated single-opposition orbits, say -- since
+    the frame's own maximum would then be an arbitrary past date.
+    """
+    global _reference_epoch_override
+    _reference_epoch_override = None if jd is None else float(jd)
+
+
+def _reference_epoch(orb):
+    """The Julian date the apparition features treat as "now" for every row in `orb`."""
+    if _reference_epoch_override is not None:
+        return _reference_epoch_override
+    env = os.environ.get("ACTIVITYSCOPE_REFERENCE_EPOCH_JD")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    ep = orb["Epoch"].to_numpy(dtype=np.float64)
+    ep = ep[np.isfinite(ep)]
+    if not ep.size:
+        return np.nan
+    t_ref = float(ep.max())
+    # Safety net for the one case auto-detection cannot get right: a frame with no standard-epoch
+    # row (e.g. a handful of freshly designated single-opposition orbits scored on their own), where
+    # the frame's own maximum is an arbitrary past date and the window silently lands in the past.
+    stale_days = (time.time() / 86400.0 + 2440587.5) - t_ref
+    if stale_days > 365.0:
+        warnings.warn(
+            f"apparition features: reference date auto-detected as JD {t_ref:.1f}, "
+            f"{stale_days / 365.25:.1f} yr in the past -- this frame appears to contain no "
+            f"standard-epoch orbit. Call set_reference_epoch(jd) with the catalog retrieval date.",
+            RuntimeWarning, stacklevel=2)
+    return t_ref
 
 
 def _load_confusion_map():
@@ -1685,14 +1896,119 @@ def _galactic_confusion(ra_deg, dec_deg):
             + img[iy1, ix] * (1 - fx) * fy + img[iy1, ix + 1] * fx * fy)
 
 
-def _solve_apparitions(orb, n_opp=_N_APPARITIONS):
-    """Times and sky positions of the n_opp most recent apparitions, relative to the MPCORB epoch.
+# Row-block size and worker count for the apparition solver. The solver holds well over a dozen
+# (rows, n_opp) float64 temporaries at once, so on the full ~1.5M-row catalogue each one is hundreds
+# of MB and every pass streams from RAM instead of cache. Splitting the catalogue into blocks keeps
+# the working set resident and, because every operation in the solver is elementwise per row, gives
+# bit-identical results for any block size. numpy releases the GIL inside its ufuncs, so the blocks
+# also run on a thread pool for free. Set ACTIVITYSCOPE_APPARITION_WORKERS=1 to force the serial path.
+#
+# 2,000 rows was measured fastest (modeling/feat_eng_speed) now that feature_engineering solves all
+# 60 apparitions at once rather than 25: at 2,000 x 60 each temporary is ~1 MB and a block's working
+# set stays in cache, where the previous 8,000 did not. The measured curve on 60k rows / 10 cores was
+# 1.81 s at 1,000, 1.28 s at 2,000, 1.33 s at 4,000, 1.83 s at 8,000 and 2.88 s at 16,000.
+_APPARITION_BLOCK_ROWS = 2_000
+
+
+def _run_row_chunks(fn, n_rows, chunk):
+    """Call fn(start, end) for consecutive row chunks, on a thread pool when more than one core is
+    available. For per-row (elementwise) work this is bit-identical to a sequential loop."""
+    pairs = [(s0, min(s0 + chunk, n_rows)) for s0 in range(0, n_rows, chunk)]
+    workers = _apparition_workers()
+    if workers > 1 and len(pairs) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda p: fn(*p), pairs))
+    else:
+        for s0, e0 in pairs:
+            fn(s0, e0)
+
+
+def _apparition_workers():
+    override = os.environ.get("ACTIVITYSCOPE_APPARITION_WORKERS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return max(1, min(os.cpu_count() or 1, 16))
+
+
+def _solve_apparitions(orb, n_opp=_N_APPARITIONS, first=0, t_ref=None):
+    """Bit-exact block-parallel wrapper around _solve_apparitions_block.
+
+    `first` is the index of the first apparition to solve (0 = the most recent), so a later call can
+    extend an earlier solve without recomputing its columns: solve(n_opp=35, first=25) yields exactly
+    the columns 25..59 that solve(n_opp=60) would.
+
+    `t_ref` is the date treated as "now" (see _reference_epoch); it is resolved once here, from the
+    whole frame, so that every block -- and every object -- shares one anchor.
+
+    Splits the frame into row blocks, solves them independently (on a thread pool when more than
+    one core is available), and concatenates. Every value matches what a single whole-frame call
+    produces, element for element -- the solver never mixes information between rows.
+    """
+    if t_ref is None:
+        t_ref = _reference_epoch(orb)
+    n_rows = len(orb)
+    workers = _apparition_workers()
+    if n_rows <= _APPARITION_BLOCK_ROWS:
+        return _solve_apparitions_block(orb, n_opp, first, t_ref)
+
+    n_blocks = -(-n_rows // _APPARITION_BLOCK_ROWS)
+    bounds = np.linspace(0, n_rows, n_blocks + 1).astype(np.int64)
+    blocks = [orb.iloc[lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:]) if hi > lo]
+    solve = lambda blk: _solve_apparitions_block(blk, n_opp, first, t_ref)
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(solve, blocks))
+    else:
+        parts = [solve(blk) for blk in blocks]
+
+    return {key: np.concatenate([part[key] for part in parts], axis=0) for key in parts[0]}
+
+
+def _slice_apparitions(G, lo, hi):
+    """Apparitions lo:hi of a solved set, as _solve_apparitions would have returned them.
+
+    The solver treats every apparition column independently -- column j is built from
+    t_last - j * S_syn and nothing else -- so this is bit-identical to
+    _solve_apparitions(orb, n_opp=hi - lo, first=lo). The per-row "epoch" entry is 1-D and is
+    passed through unchanged.
+    """
+    return {k: (v[:, lo:hi] if v.ndim == 2 else v) for k, v in G.items()}
+
+
+# The two apparition windows in use, the 50-yr one (_N_APPARITIONS_50) and the detectable-
+# apparition one (_DET_N_APPARITIONS), happen to be the same depth today. _shared_apparition_solve
+# solves the deeper of the two rather than relying on that, and each block slices what it needs.
+_APPARITION_INPUT_COLUMNS = ("a", "e", "i", "Node", "Peri", "M", "Epoch", "H")
+
+
+def _shared_apparition_solve(orb):
+    """(G, t_ref) for the deepest apparition set any feature block needs, or (None, None) if the
+    frame has no orbital elements to propagate (each block then fills its columns with NaN)."""
+    if not all(c in orb.columns for c in _APPARITION_INPUT_COLUMNS):
+        return None, None
+    n_opp = max(_N_APPARITIONS_50, _DET_N_APPARITIONS)
+    t_ref = _reference_epoch(orb)
+    return _solve_apparitions(orb, n_opp=n_opp, t_ref=t_ref), t_ref
+
+
+def _solve_apparitions_block(orb, n_opp=_N_APPARITIONS, first=0, t_ref=None):
+    """Times and sky positions of the n_opp most recent apparitions, relative to the reference date.
 
     Opposition times come from a linear mean-longitude estimate refined by Newton iteration on the
     true ecliptic longitude difference. The most recent apparition is bracketed to lie at or before
-    the epoch, and validity is TWO-SIDED (inside the lookback window and not in the future); a
-    one-sided guard leaves roughly half of all objects with apparitions dated after the epoch.
+    the reference date `t_ref` (see _reference_epoch -- one shared "now" for the whole catalogue,
+    NOT each object's own catalogue epoch), and validity is TWO-SIDED (inside the lookback window
+    and not in the future); a one-sided guard leaves roughly half of all objects with apparitions
+    dated after the reference date.
+
+    The per-object Epoch is still used for what it is for: propagating the mean anomaly to an
+    arbitrary time inside ast_xyz.
     """
+    if t_ref is None:
+        t_ref = _reference_epoch(orb)
     f = lambda c: orb[c].to_numpy(dtype=np.float64)
     a, e = f("a"), f("e")
     inc, node, peri = np.radians(f("i")), np.radians(f("Node")), np.radians(f("Peri"))
@@ -1700,42 +2016,77 @@ def _solve_apparitions(orb, n_opp=_N_APPARITIONS):
     n_mm = np.sqrt(0.0002959122082855911) / np.power(np.maximum(a, 1e-9), 1.5)
     n_earth = 2.0 * np.pi / 365.256
 
+    # Everything the propagation needs that depends only on the object, not on the apparition, is
+    # computed once here on the (rows,) vectors and then broadcast as a (rows, 1) column. The old
+    # form tiled each element to (rows, n_opp) with B() and recomputed cos(i), sin(i), cos(Node),
+    # sin(Node) and the sqrt(1 +/- e) pair from the tiled copy on every one of the five ast_xyz
+    # calls. A ufunc of a tiled value is the same bits as the tiled ufunc of the value, so this
+    # only removes work -- roughly a third of the solver's ufunc traffic.
+    col = lambda v: v[:, None]
+    a_c, e_c, peri_c, M0_c, epoch_c, n_c = (col(v) for v in (a, e, peri, M0, epoch, n_mm))
+    ci, si = col(np.cos(inc)), col(np.sin(inc))
+    cO, sO = col(np.cos(node)), col(np.sin(node))
+    sqrt_1pe, sqrt_1me = col(np.sqrt(1.0 + e)), col(np.sqrt(1.0 - e))
+
+    def earth_lon(t):
+        """Earth's heliocentric ecliptic longitude alone -- all the refinement loop reads."""
+        T = (t - 2451545.0) / 36525.0
+        M = np.radians(357.52911 + 35999.05029 * T)
+        return (np.radians(280.46646 + 36000.76983 * T)
+                + 0.033416 * np.sin(M) + 0.000349 * np.sin(2.0 * M)) + np.pi
+
     def earth_xy(t):
         T = (t - 2451545.0) / 36525.0
         M = np.radians(357.52911 + 35999.05029 * T)
         lam = (np.radians(280.46646 + 36000.76983 * T)
                + 0.033416 * np.sin(M) + 0.000349 * np.sin(2.0 * M)) + np.pi
         r = 1.00014061 - 0.01670861 * np.cos(M) - 0.00013957 * np.cos(2.0 * M)
-        return r * np.cos(lam), r * np.sin(lam), lam
+        return r * np.cos(lam), r * np.sin(lam)
 
-    def ast_xyz(t, A, E_, I_, O_, W_, M_, EP, N_):
-        MM = np.mod(M_ + N_ * (t - EP) + np.pi, 2.0 * np.pi) - np.pi
-        EA = MM + E_ * np.sin(MM)
+    def _in_plane(t):
+        """(r, cos u, sin u) at t: Kepler's equation by the validated 12 fixed Newton passes,
+        then the true anomaly by the half-angle arctan2 form."""
+        MM = np.mod(M0_c + n_c * (t - epoch_c) + np.pi, 2.0 * np.pi) - np.pi
+        EA = MM + e_c * np.sin(MM)
         for _ in range(12):
-            EA = EA - (EA - E_ * np.sin(EA) - MM) / np.maximum(1.0 - E_ * np.cos(EA), 1e-12)
-        nu = 2.0 * np.arctan2(np.sqrt(1 + E_) * np.sin(EA / 2), np.sqrt(1 - E_) * np.cos(EA / 2))
-        r = A * (1.0 - E_ * np.cos(EA))
-        u = W_ + nu
-        cu, su, ci, si, cO, sO = np.cos(u), np.sin(u), np.cos(I_), np.sin(I_), np.cos(O_), np.sin(O_)
+            EA = EA - (EA - e_c * np.sin(EA) - MM) / np.maximum(1.0 - e_c * np.cos(EA), 1e-12)
+        nu = 2.0 * np.arctan2(sqrt_1pe * np.sin(EA / 2), sqrt_1me * np.cos(EA / 2))
+        r = a_c * (1.0 - e_c * np.cos(EA))
+        u = peri_c + nu
+        return r, np.cos(u), np.sin(u)
+
+    def ast_xy(t):
+        """Heliocentric ecliptic x, y at t. The refinement loop needs only the longitude, so z
+        and r are not formed."""
+        r, cu, su = _in_plane(t)
+        return r * (cO * cu - sO * su * ci), r * (sO * cu + cO * su * ci)
+
+    def ast_xyz(t):
+        r, cu, su = _in_plane(t)
         return (r * (cO * cu - sO * su * ci), r * (sO * cu + cO * su * ci), r * su * si, r)
 
     rel = n_mm - n_earth
     rel = np.where(np.abs(rel) < 1e-6, np.sign(rel + 1e-12) * 1e-6, rel)
-    _, _, lam_e0 = earth_xy(epoch)
-    d0 = np.mod(np.mod(node + peri + M0, 2 * np.pi) - lam_e0 + np.pi, 2 * np.pi) - np.pi
+    # Mean longitude of the object AT THE REFERENCE DATE, not at its own epoch: M0 is stated at the
+    # object's Epoch, so it must be advanced by n*(t_ref - Epoch) before it can be differenced
+    # against Earth's longitude at t_ref. For the 99.4% of the catalogue restated to the standard
+    # epoch this term is zero; for the displaced short-arc orbits it is what moves their window out
+    # of the past and up to the present.
+    M_ref = M0 + n_mm * (t_ref - epoch)
+    lam_e0 = earth_lon(t_ref)
+    d0 = np.mod(np.mod(node + peri + M_ref, 2 * np.pi) - lam_e0 + np.pi, 2 * np.pi) - np.pi
     S_syn = np.abs(2.0 * np.pi / rel)
-    t_last = epoch - d0 / rel
-    t_last = t_last - np.ceil((t_last - epoch) / S_syn) * S_syn      # force to at-or-before the epoch
-    t = t_last[:, None] - np.arange(n_opp)[None, :] * S_syn[:, None]
+    t_last = t_ref - d0 / rel
+    t_last = t_last - np.ceil((t_last - t_ref) / S_syn) * S_syn      # force to at-or-before t_ref
+    t = t_last[:, None] - np.arange(first, first + n_opp)[None, :] * S_syn[:, None]
 
-    B = lambda v: v[:, None] * np.ones((1, n_opp))
+    rel_c = col(rel)
     for _ in range(4):
-        x, y, z, _r = ast_xyz(t, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
-        _, _, lam_e = earth_xy(t)
-        t = t - (np.mod(np.arctan2(y, x) - lam_e + np.pi, 2 * np.pi) - np.pi) / B(rel)
+        x, y = ast_xy(t)
+        t = t - (np.mod(np.arctan2(y, x) - earth_lon(t) + np.pi, 2 * np.pi) - np.pi) / rel_c
 
-    x, y, z, r = ast_xyz(t, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
-    xe, ye, _ = earth_xy(t)
+    x, y, z, r = ast_xyz(t)
+    xe, ye = earth_xy(t)
     dx, dy, dz = x - xe, y - ye, z
     delta = np.sqrt(dx * dx + dy * dy + dz * dz)
     obl = np.radians(23.439291)
@@ -1749,85 +2100,670 @@ def _solve_apparitions(orb, n_opp=_N_APPARITIONS):
     V = (H[:, None] + 5.0 * np.log10(np.maximum(r * delta, 1e-12))
          - 2.5 * np.log10(hg_phase(np.arccos(cos_alpha))))
 
-    # sky-plane rate: angular motion of the geocentric direction over one day, for trailing loss
-    x2, y2, z2, _ = ast_xyz(t + 1.0, B(a), B(e), B(inc), B(node), B(peri), B(M0), B(epoch), B(n_mm))
-    xe2, ye2, _ = earth_xy(t + 1.0)
-    u1 = np.stack([dx, dy, dz], 0)
-    u2 = np.stack([x2 - xe2, y2 - ye2, z2], 0)
-    u1 = u1 / np.maximum(np.linalg.norm(u1, axis=0), 1e-12)
-    u2 = u2 / np.maximum(np.linalg.norm(u2, axis=0), 1e-12)
-    rate = np.degrees(np.arccos(np.clip((u1 * u2).sum(0), -1, 1)))
-
-    age = epoch[:, None] - t
+    age = t_ref - t
     valid = (age <= _LOOKBACK_DAYS) & (age >= -1.0)
-    return dict(t=t, V=V, dec=np.degrees(dec), gal_b=np.degrees(gal_b), rate=rate,
-                ra=np.mod(np.degrees(ra), 360.0), valid=valid, epoch=epoch)
+    # "epoch" now carries the shared reference date, broadcast per row, not the per-object Epoch.
+    return dict(t=t, V=V, dec=np.degrees(dec), gal_b=np.degrees(gal_b),
+                ra=np.mod(np.degrees(ra), 360.0), valid=valid,
+                epoch=np.full(len(a), t_ref, dtype=np.float64))
 
 
 def _era_limiting_magnitude(year):
-    out = np.where(year >= _ERA_YEARS[0], _ERA_VLIM[0], np.nan)
-    for yr, vl in zip(_ERA_YEARS[1:], _ERA_VLIM[1:]):
+    """Legacy hand-set limiting magnitude for the 20-yr window (fallback only)."""
+    out = np.full(np.shape(year), _ERA_VLIM[0])
+    for yr, vl in zip(_ERA_YEARS, _ERA_VLIM[1:]):
         out = np.where(year >= yr, vl, out)
     return out
 
 
-def add_survey_era_features(orb):
-    """Adds the five survey-era apparition features. Safe to call on any orbit frame."""
-    needed = ("a", "e", "i", "Node", "Peri", "M", "Epoch", "H")
+def _era50_limiting_magnitude(year):
+    """Legacy hand-set limiting magnitude for the 50-yr window (fallback only).
+
+    NaN (no surveys) before the first era.
+    """
+    out = np.full(np.shape(year), np.nan)
+    for yr, vl in zip(_ERA50_YEARS, _ERA50_VLIM):
+        out = np.where(year >= yr, vl, out)
+    return out
+
+
+# --- the measured calibration -------------------------------------------------
+# survey_efficiency_by_year.csv and survey_coverage_by_dec.csv are produced by
+# modeling/survey_efficiency/derive_efficiency.py, which measures eta_0(t),
+# V_50(t), w(t) and the declination coverage map from the MPC astrometry
+# archive (see that script and modeling/survey_efficiency/REPORT.md). They
+# replace both hand-set era tables and the fixed declination taper. If they are
+# absent -- a checkout without the calibration, or a caller who has moved the
+# working directory -- everything below falls back to the legacy constants, so
+# the module keeps working, just with the old approximations.
+
+_EFFICIENCY_FILES = ("survey_efficiency_by_year.csv",
+                     os.path.join("modeling", "survey_efficiency",
+                                  "survey_efficiency_by_year.csv"))
+_COVERAGE_FILES = ("survey_coverage_by_dec.csv",
+                   os.path.join("modeling", "survey_efficiency",
+                                "survey_coverage_by_dec.csv"))
+_calibration_cache = {}
+
+
+def _find_calibration(paths):
+    # An explicit escape hatch, for reproducing the pre-calibration behaviour
+    # without deleting the CSVs (used by the paired evaluation in
+    # modeling/survey_efficiency/evaluate_calibration.py).
+    if os.environ.get("ACTIVITYSCOPE_DISABLE_MEASURED_EFFICIENCY"):
+        return None
+    # A directory holding an alternative calibration, for comparing one fit
+    # against another without moving the shipped CSVs.
+    alt = os.environ.get("ACTIVITYSCOPE_CALIBRATION_DIR")
+    if alt:
+        cand = os.path.join(alt, os.path.basename(paths[0]))
+        return cand if os.path.exists(cand) else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in paths:
+        for base in ("", here):
+            cand = os.path.join(base, p) if base else p
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
+def _efficiency_table():
+    """(years, eta_0, V_50, log width) from the measured calibration, or None."""
+    if "eff" not in _calibration_cache:
+        path = _find_calibration(_EFFICIENCY_FILES)
+        if path is None:
+            _calibration_cache["eff"] = None
+        else:
+            df = pd.read_csv(path).sort_values("year")
+            _calibration_cache["eff"] = (
+                df["year"].to_numpy(dtype=np.float64),
+                df["eta0"].to_numpy(dtype=np.float64),
+                df["V50"].to_numpy(dtype=np.float64),
+                np.log(df["width"].to_numpy(dtype=np.float64)))
+    return _calibration_cache["eff"]
+
+
+def _coverage_table():
+    """(years, dec bin centres, factor grid) from the measured calibration, or None."""
+    if "cov" not in _calibration_cache:
+        path = _find_calibration(_COVERAGE_FILES)
+        if path is None:
+            _calibration_cache["cov"] = None
+        else:
+            df = pd.read_csv(path)
+            df["dec_mid"] = 0.5 * (df["dec_lo"] + df["dec_hi"])
+            grid = df.pivot(index="year", columns="dec_mid", values="factor").sort_index()
+            _calibration_cache["cov"] = (grid.index.to_numpy(dtype=np.float64),
+                                         grid.columns.to_numpy(dtype=np.float64),
+                                         grid.to_numpy(dtype=np.float64))
+    return _calibration_cache["cov"]
+
+
+def clear_calibration_cache():
+    """Forget the loaded calibration, so the next call re-reads the CSVs."""
+    _calibration_cache.clear()
+
+
+def _magnitude_detection(year, V, window=50):
+    """The magnitude term of the detection probability, eta_0(t) * sigmoid.
+
+    With the measured calibration this is eta_0(t) / (1 + exp((V - V_50(t))/w(t))):
+    a ceiling that carries how much of the sky the surveys of that year actually
+    reached, times a roll-off whose midpoint and width are measured for that
+    year. Outside the calibrated span the end values are held, so a year after
+    the last measured one is scored with the most recent measured behaviour
+    until the calibration is rebuilt.
+
+    Without it, the legacy behaviour: a unit ceiling and a logistic of fixed
+    width _MAG_WIDTH around the hand-set era limiting magnitude, `window`
+    selecting the 20-yr or 50-yr table.
+    """
+    tab = _efficiency_table()
+    if tab is None:
+        vlim = (_era50_limiting_magnitude(year) if window == 50
+                else _era_limiting_magnitude(year))
+        return (1.0 / (1.0 + np.exp(-np.clip((vlim - V) / _MAG_WIDTH, -30, 30))),
+                np.isfinite(vlim))
+    years, eta0, v50, logw = tab
+    e = np.interp(year, years, eta0, left=0.0, right=eta0[-1])
+    m = np.interp(year, years, v50, left=v50[0], right=v50[-1])
+    w = np.exp(np.interp(year, years, logw, left=logw[0], right=logw[-1]))
+    p = e / (1.0 + np.exp(np.clip((V - m) / w, -30, 30)))
+    return p, np.isfinite(p)
+
+
+def _threshold_magnitude(year, window=20):
+    """A single limiting magnitude for the year, for the one feature that needs a hard cut.
+
+    n_detect_windows counts runs of "detectable" samples on a time grid, which
+    is a threshold question, not a probability one. With the measured
+    calibration the threshold is V_50(t) -- the magnitude at which the survey
+    system of that year detected half of what it could -- rather than the
+    hand-set era value.
+    """
+    tab = _efficiency_table()
+    if tab is None:
+        return (_era50_limiting_magnitude(year) if window == 50
+                else _era_limiting_magnitude(year))
+    years, _eta0, v50, _logw = tab
+    return np.interp(year, years, v50, left=v50[0], right=v50[-1])
+
+
+def _declination_coverage(year, dec):
+    """The declination term: the measured coverage map, else the fixed taper."""
+    tab = _coverage_table()
+    if tab is None:
+        return np.clip(
+            (1.0 / (1.0 + np.exp(-(dec - _DEC_SOUTH) / _DEC_SOFT)))
+            * (1.0 / (1.0 + np.exp((dec - _DEC_NORTH) / _DEC_SOFT))), 0.0, 1.0)
+    years, centres, grid = tab
+    # Apparitions outside the window carry NaN declinations. The fixed taper
+    # propagated those to NaN; a table lookup would index on them, so mask them
+    # out here and put the NaN back at the end.
+    dec = np.asarray(dec, dtype=np.float64)
+    bad = ~(np.isfinite(dec) & np.isfinite(year))
+    dec = np.where(bad, 0.0, dec)
+    fy = np.interp(np.where(bad, years[0], year), years,
+                   np.arange(len(years), dtype=np.float64))
+    i0 = np.clip(np.floor(fy), 0, len(years) - 1).astype(np.intp)
+    i1 = np.minimum(i0 + 1, len(years) - 1)
+    wy = fy - i0
+    fd = np.interp(dec, centres, np.arange(len(centres), dtype=np.float64))
+    j0 = np.clip(np.floor(fd), 0, len(centres) - 1).astype(np.intp)
+    j1 = np.minimum(j0 + 1, len(centres) - 1)
+    wd = fd - j0
+    g = ((1.0 - wy) * ((1.0 - wd) * grid[i0, j0] + wd * grid[i0, j1])
+         + wy * ((1.0 - wd) * grid[i1, j0] + wd * grid[i1, j1]))
+    return np.where(bad, np.nan, np.clip(g, 0.0, 1.0))
+
+
+def _detection_probability(G, valid, year, window=50):
+    """Per-apparition detection probability p_j = p_mag * p_gal * p_dec (zero where not valid)."""
+    V = np.where(valid, G["V"], np.nan)
+    conf = np.where(valid, _galactic_confusion(G["ra"], G["dec"]), np.nan)
+    p_mag, mag_ok = _magnitude_detection(year, V, window=window)
+    p_gal = 1.0 / (1.0 + np.power(np.maximum(conf, 0.0) / _GAL_HALF, _GAL_POW))
+    dec_a = np.where(valid, G["dec"], np.nan)
+    p_dec = _declination_coverage(year, dec_a)
+    ok = valid & np.isfinite(p_gal) & mag_ok
+    return np.where(ok, np.clip(p_mag * p_gal * p_dec, 0.0, 1.0), 0.0)
+
+
+def _days_since_last_opp(G, t_ref):
+    """Days from the most recent apparition inside the lookback window to the reference date,
+    NaN for an object with none. Shared by add_last_opposition_feature and, for the same column,
+    add_survey_era_features."""
+    ok = G["valid"]
+    has_any = ok.any(axis=1)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        t_last = np.where(has_any, np.nanmax(np.where(ok, G["t"], -np.inf), axis=1), np.nan)
+        return np.where(has_any, t_ref - t_last, np.nan).astype(float)
+
+
+def add_last_opposition_feature(orb, G=None, t_ref=None):
+    """Adds days_since_last_opp, the one column of the survey-era block still in the model.
+
+    Split out so the lean feature set can have it without the superseded E_* family that
+    add_survey_era_features computes around it. `G` / `t_ref` are a shared solve as in
+    add_survey_era_features. Safe to call on any orbit frame.
+    """
+    if not all(c in orb.columns for c in _APPARITION_INPUT_COLUMNS):
+        orb["days_since_last_opp"] = np.nan
+        return orb
+    if t_ref is None:
+        t_ref = _reference_epoch(orb)
+    if G is None:
+        G = _solve_apparitions(orb, t_ref=t_ref)
+    orb["days_since_last_opp"] = _days_since_last_opp(
+        _slice_apparitions(G, 0, _N_APPARITIONS), t_ref)
+    return orb
+
+
+def add_survey_era_features(orb, G=None, t_ref=None):
+    """Adds the survey-era apparition features. Safe to call on any orbit frame.
+
+    `G` is an already-solved apparition set of at least _N_APPARITIONS_50 apparitions, sharing the
+    reference date `t_ref` (feature_engineering solves once and passes it to every block). When it
+    is None the two solves are done here, exactly as before.
+    """
+    needed = _APPARITION_INPUT_COLUMNS
     if not all(c in orb.columns for c in needed):
-        for c in ("gal_lat_frac_low", "days_since_last_opp", "first_det_year", "E_full_w03", "E_var"):
+        for c in ("gal_lat_frac_low", "days_since_last_opp", "first_det_year", "years_detectable",
+                  "E_full_w03", "E_var", "days_since_last_detectable_E50yr", "year_brightest_app",
+                  "years_since_brightest_app", "E_50yr"):
             orb[c] = np.nan
         return orb
 
-    G = _solve_apparitions(orb)
-    ok = G["valid"]
-    year = 2000.0 + (G["t"] - 2451545.0) / 365.25
-    in_era = ok & (year >= _SURVEY_START_YEAR)
+    # One shared "now" for every object and for both solves (the 25-apparition set and the 35 extra
+    # ones E_50yr needs), so the two windows line up and no object is scored against its own past.
+    if t_ref is None:
+        t_ref = _reference_epoch(orb)
+    if G is None:
+        G25 = _solve_apparitions(orb, t_ref=t_ref)
+        G2 = _solve_apparitions(orb, n_opp=_N_APPARITIONS_50 - _N_APPARITIONS,
+                                first=_N_APPARITIONS, t_ref=t_ref)
+    else:
+        G25 = _slice_apparitions(G, 0, _N_APPARITIONS)
+        G2 = _slice_apparitions(G, _N_APPARITIONS, _N_APPARITIONS_50)
+    ok = G25["valid"]
+    year = 2000.0 + (G25["t"] - 2451545.0) / 365.25
     n_ok = np.maximum(ok.sum(axis=1), 1)
     nan_if = lambda A: np.where(ok, A, np.nan)
 
     with np.errstate(all="ignore"), warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        abs_b = np.abs(nan_if(G["gal_b"]))
+        abs_b = np.abs(nan_if(G25["gal_b"]))
         orb["gal_lat_frac_low"] = (np.nansum(abs_b < _GAL_LOW_EDGE, axis=1) / n_ok).astype(float)
 
         has_any = ok.any(axis=1)
-        t_last = np.where(has_any, np.nanmax(np.where(ok, G["t"], -np.inf), axis=1), np.nan)
-        orb["days_since_last_opp"] = np.where(has_any, G["epoch"] - t_last, np.nan).astype(float)
+        orb["days_since_last_opp"] = _days_since_last_opp(G25, t_ref)
 
-        V = nan_if(G["V"])
-        margin = _era_limiting_magnitude(year) - V
-        detectable = np.where(in_era, margin > 0, False)
+        V = nan_if(G25["V"])
+        detectable = np.where(ok, V < _FIRST_DET_VLIM, False)
         any_det = detectable.sum(axis=1) > 0
         orb["first_det_year"] = np.where(
             any_det, np.nanmin(np.where(detectable, year, np.nan), axis=1), np.nan).astype(float)
 
+        # years_detectable: the same quantity as an elapsed duration rather than a calendar year --
+        # how long the object has been discoverable, counting back from the reference date. It
+        # carries identical information (the two differ by a constant, the reference year) but states
+        # it as a length of time, so a split on it names "has been detectable for less than N
+        # years" instead of "was first detectable before calendar year Y". Replaces first_det_year
+        # in the model feature list: on 1.17M rows held out from the selection subsample it is
+        # -0.150% Poisson deviance (95% CI [-0.205%, -0.092%]) for +0.075% log-loss (CI
+        # [-0.006%, +0.152%]). first_det_year is still computed, for the appendix and for anything
+        # that references it.
+        orb["years_detectable"] = (
+            2000.0 + (t_ref - 2451545.0) / 365.25 - orb["first_det_year"]).astype(float)
+
         # --- the analytical detection model: a PRODUCT of independent factors, summed ---
         # A boosted tree splits one column at a time and cannot form products, so supplying the
         # product explicitly is what makes this worth more than its ingredients separately.
-        conf = np.where(in_era, _galactic_confusion(G["ra"], G["dec"]), np.nan)
+        p = _detection_probability(G25, ok, year, window=20)
+        orb["E_full_w03"] = p.sum(axis=1).astype(float)   # 20-yr count, kept for reference only
+
+        # Calendar year of the brightest apparition in the window, and the same quantity as an
+        # elapsed duration. As with first_det_year/years_detectable the two differ only by the
+        # constant reference year, but the duration form is stationary under retraining, so it is
+        # the one in the model feature list. year_brightest_app is still computed for reference.
+        i_bright = np.argmin(np.where(np.isnan(V), np.inf, V), axis=1)
+        orb["year_brightest_app"] = np.where(
+            has_any, year[np.arange(len(orb)), i_bright], np.nan).astype(float)
+        orb["years_since_brightest_app"] = (
+            2000.0 + (t_ref - 2451545.0) / 365.25 - orb["year_brightest_app"]).astype(float)
+
+        # --- E_50yr: the same detection model over a 50-yr window ---
+        # The catalogue counts every opposition ever linked, and bright objects have oppositions
+        # from long before the 20-yr window; E_full_w03 cannot see them, and a SHAP analysis of
+        # {E, vis_q, H} showed most of what H adds to E is exactly that pre-window history
+        # (modeling/feature_eng2 on branch feature-eng-2). Extending the window to 50 yr with
+        # era-appropriate limiting magnitudes puts it inside E: swapped for E_full_w03 it is
+        # -0.60% Poisson deviance and -0.47% log-loss (train 200k / test 1.17M).
+        # Only the 35 additional apparitions are solved; the first 25 are reused from G above
+        # (the solver is elementwise per apparition, so this is identical to a single 60-solve).
+        # E_var and days_since_last_detectable_E50yr use the SAME 50-yr probabilities, so the three
+        # columns form one consistent construction. (The 20-yr versions were marginally better:
+        # +0.12% Poisson deviance, +0.12% log-loss n.s. on 1.17M held-out rows for the pair, a
+        # price accepted for a single window and era table in the paper.)
+        e50 = np.zeros(len(orb)); v50 = np.zeros(len(orb)); t_det = np.full(len(orb), -np.inf)
+        for Gk in (G25, G2):
+            age = t_ref - Gk["t"]
+            valid50 = (age <= _LOOKBACK_DAYS_50) & (age >= -1.0)
+            yr = 2000.0 + (Gk["t"] - 2451545.0) / 365.25
+            p50 = _detection_probability(Gk, valid50, yr, window=50)
+            e50 += p50.sum(axis=1)
+            v50 += (p50 * (1.0 - p50)).sum(axis=1)                       # Poisson-binomial variance
+            t_det = np.maximum(t_det, np.where(p50 > 0.5, Gk["t"], -np.inf).max(axis=1))
+        orb["E_50yr"] = e50.astype(float)
+        orb["E_var"] = v50.astype(float)
+        # Recency of the last real opportunity: days from the most recent apparition with p_j > 0.5
+        # to the reference date (undefined when no apparition clears 0.5).
+        orb["days_since_last_detectable_E50yr"] = np.where(np.isfinite(t_det), t_ref - t_det, np.nan).astype(float)
+
+    return orb
+
+
+# --- the compact detectable-apparition features -------------------------------
+# A deliberately simple alternative to the E_50yr family: the same reconstructed
+# apparitions, scored against a survey depth that is a two-constant linear ramp in
+# time and a galactic-plane weight that is a linear taper in |b|. No confusion map,
+# no declination map, no per-year calibration. Selected in
+# modeling/compact_revision (paired 5-fold LightGBM on the full training frame).
+_DET_V_NOW = 22.0            # limiting magnitude reached in _DET_Y_NOW and held thereafter
+_DET_Y_NOW = 2022.0
+_DET_SLOPE = 0.12            # mag per year that the limit deepened, going back in time
+_DET_WINDOW_DAYS = 50.0 * 365.25
+_DET_N_APPARITIONS = 60
+_DET_GAL_TAPER_DEG = 30.0    # in-plane weight rises linearly from 0 at b = 0 to 1 at this |b|
+
+
+def _survey_limit(year):
+    """V_lim(t): the simple survey-depth ramp, 22.0 in 2022 and 0.12 mag/yr shallower before."""
+    year = np.asarray(year, dtype=np.float64)
+    return np.minimum(_DET_V_NOW, _DET_V_NOW - _DET_SLOPE * (_DET_Y_NOW - year))
+
+
+def _galactic_taper(gal_b_deg):
+    """w(b): linear taper from 0 on the galactic plane to 1 at |b| = _DET_GAL_TAPER_DEG."""
+    return np.minimum(np.abs(gal_b_deg) / _DET_GAL_TAPER_DEG, 1.0)
+
+
+def add_detectable_apparition_features(orb, G=None, t_ref=None):
+    """Adds n_detectable, n_detectable_var, years_since_first_detectable and days_since_last_detectable.
+
+    Every apparition j in the 50 years before the reference date gets a detection weight
+        p_j = [1 + exp((V_j - V_lim(t_j)) / 0.3 mag)]^-1 * w(b_j),
+    the product of a soft brightness threshold against the survey-depth ramp and the galactic
+    taper. `G` is an already-solved apparition set sharing the reference date `t_ref`, as
+    feature_engineering passes in; when it is None the solve is done here.
+    n_detectable is the sum of p_j (an estimate of how many apparitions the object was bright
+    and well placed enough to be found at), n_detectable_var the Poisson-binomial variance
+    sum p_j (1 - p_j), and the two timing columns are the elapsed time since the earliest and
+    since the most recent apparition with p_j > 1/2 (NaN when there is none).
+    Safe to call on any orbit frame; needs the same columns as add_survey_era_features.
+    """
+    cols = ("n_detectable", "n_detectable_var", "years_since_first_detectable", "days_since_last_detectable")
+    needed = _APPARITION_INPUT_COLUMNS
+    if not all(c in orb.columns for c in needed):
+        for c in cols:
+            orb[c] = np.nan
+        return orb
+    if t_ref is None:
+        t_ref = _reference_epoch(orb)
+    if G is None:
+        G = _solve_apparitions(orb, n_opp=_DET_N_APPARITIONS, t_ref=t_ref)
+    elif G["t"].shape[1] != _DET_N_APPARITIONS:
+        G = _slice_apparitions(G, 0, _DET_N_APPARITIONS)
+    for c, v in zip(cols, _detectable_from_apparitions(G, t_ref)):
+        orb[c] = v
+    return orb
+
+
+def _detectable_from_apparitions(G, t_ref, h_offset=0.0):
+    """(n_detectable, n_detectable_var, years_since_first_detectable, days_since_last_detectable) from a solved apparition
+    set G (as returned by _solve_apparitions with _DET_N_APPARITIONS apparitions).
+
+    `h_offset` shifts every apparent magnitude by a constant, so the same geometry can be scored
+    at a fainter H without another propagation (used by pessimistic_detectable_bounds).
+    Apparitions with non-finite geometry (a degenerate clone orbit) are treated as not in the
+    window.
+    """
+    age = t_ref - G["t"]
+    inwin = (age <= _DET_WINDOW_DAYS) & (age >= -1.0) & np.isfinite(G["V"]) & np.isfinite(G["gal_b"])
+    year = 2000.0 + (G["t"] - 2451545.0) / 365.25
+    with np.errstate(all="ignore"):
+        margin = np.where(inwin, _survey_limit(year) - (G["V"] + h_offset), np.nan)
         p_mag = 1.0 / (1.0 + np.exp(-np.clip(margin / _MAG_WIDTH, -30, 30)))
-        p_gal = 1.0 / (1.0 + np.power(np.maximum(conf, 0.0) / _GAL_HALF, _GAL_POW))
-        dec_a = nan_if(G["dec"])
-        p_dec = np.clip(
-            (1.0 / (1.0 + np.exp(-(dec_a - _DEC_SOUTH) / _DEC_SOFT)))
-            * (1.0 / (1.0 + np.exp((dec_a - _DEC_NORTH) / _DEC_SOFT))), 0.0, 1.0)
-        trail_mag = 2.5 * np.log10(np.maximum(
-            1.0 + nan_if(G["rate"]) * 3600.0 * _EXP_SECONDS / 86400.0 / _SEEING_ARCSEC, 1.0))
-        p_trail = np.power(10.0, -0.4 * np.maximum(trail_mag, 0.0))
-        p = np.where(in_era & np.isfinite(p_gal),
-                     np.clip(p_mag * p_gal * p_dec * p_trail, 0.0, 1.0), 0.0)
-        orb["E_full_w03"] = p.sum(axis=1).astype(float)
+        p = np.where(inwin, p_mag * _galactic_taper(np.where(inwin, G["gal_b"], 0.0)), 0.0)
+        det = p > 0.5
+        any_det = det.any(axis=1)
+        n_detectable = p.sum(axis=1).astype(float)
+        n_var = (p * (1.0 - p)).sum(axis=1).astype(float)
+        first = np.where(det, age, -np.inf).max(axis=1)
+        last = np.where(det, age, np.inf).min(axis=1)
+        yrs_first = np.where(any_det, first / 365.25, np.nan).astype(float)
+        days_last = np.where(any_det, last, np.nan).astype(float)
+    return n_detectable, n_var, yrs_first, days_last
 
-        # E_var deliberately uses the WIDER magnitude cutoff (_MAG_WIDTH_VAR), not the sharp one above.
-        # That asymmetry is not principled - it is how the validated variant happened to be generated -
-        # but it is what the +9.33% holdout result was measured with, so it is reproduced exactly here.
-        # A consistent-width variance is worth testing before any future change.
-        p_mag_v = 1.0 / (1.0 + np.exp(-np.clip(margin / _MAG_WIDTH_VAR, -30, 30)))
-        p_v = np.where(in_era & np.isfinite(p_gal),
-                       np.clip(p_mag_v * p_gal * p_dec * p_trail, 0.0, 1.0), 0.0)
-        orb["E_var"] = (p_v * (1.0 - p_v)).sum(axis=1).astype(float)
 
+# --- pessimistic re-scoring: orbit covariances and lower bounds on n_detectable ---
+# n_detectable is a sum of steep per-apparition weights evaluated at a point estimate of an
+# orbit that, for a short-arc object, is often barely constrained: a small error in a becomes
+# a large error in orbital phase over the 50-year lookback, and phase decides which apparitions
+# are scored against the modern survey depth. The notebook's pessimistic second pass therefore
+# re-scores the strongest single-opposition candidates at the node that MINIMISES n_detectable
+# over a few Gauss-Hermite nodes along the line of variation of the published MPC orbit
+# covariance, each at the catalogued H and at H + 0.3 (fainter, hence less detectable).
+#
+# The covariances come from public.mpc_orbits on the SBN PostgreSQL mirror. The full
+# covariance lives in mpc_orb_jsonb->'COM'->'covariance' as the upper triangle of a 10x10
+# matrix (cov<i><j>): six cometary elements [q, e, i, node, argperi, peri_time] followed by
+# four non-gravitational parameters, null unless fitted. Only the leading 6x6 block is used.
+# Credentials come from the environment; nothing is stored in the repository:
+#     SBN_DB_HOST        default 173.208.144.38
+#     SBN_DB_PORT        default 5432
+#     SBN_DB_NAME        default sbn
+#     SBN_DB_USER        default pub  (read-only)
+#     SBN_PUB_PASSWORD   required
+_SBN_COM_NAMES = ["q", "e", "i", "node", "argperi", "peri_time"]
+_GAUSS_K_DEG = 0.9856076686          # mean motion in deg/day at a = 1 AU
+_MJD_TO_JD = 2400000.5
+_PESSIMISTIC_H_OFFSET = 0.3          # magnitudes fainter for the pessimistic arm
+_PESSIMISTIC_LOV_NODES = 5           # a short-arc covariance is ~99.9% rank one
+_PESSIMISTIC_T_REF = 2461200.5       # fixed reference epoch so the bound is reproducible
+_PESSIMISTIC_CHUNK_ROWS = 200_000    # node-rows per apparition solve
+DETECTABLE_COLS = ("n_detectable", "n_detectable_var",
+                   "years_since_first_detectable", "days_since_last_detectable")
+
+
+def sbn_connect():
+    """A read-only psycopg2 connection to the SBN orbit mirror (see the note above for the environment)."""
+    password = os.environ.get("SBN_PUB_PASSWORD")
+    if not password:
+        raise RuntimeError("set SBN_PUB_PASSWORD (read-only 'pub' role) in the environment")
+    import psycopg2          # not a hard dependency of the module: only the pessimistic pass needs it
+    return psycopg2.connect(
+        host=os.environ.get("SBN_DB_HOST", "173.208.144.38"),
+        port=int(os.environ.get("SBN_DB_PORT", "5432")),
+        dbname=os.environ.get("SBN_DB_NAME", "sbn"),
+        user=os.environ.get("SBN_DB_USER", "pub"),
+        password=password, connect_timeout=30)
+
+
+def sbn_fetch_covariances(designations, conn=None):
+    """{designation: dict(values, sigmas, cov, incomplete, epoch_mjd, h, stats)} from public.mpc_orbits.
+
+    `values`, `sigmas` and the 6x6 `cov` are the cometary elements [q, e, i, node, argperi, peri_time];
+    objects without a published covariance are omitted. Opens (and closes) its own connection when
+    `conn` is None; pass one in when fetching in batches.
+    """
+    close = conn is None
+    conn = conn or sbn_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            select unpacked_primary_provisional_designation,
+                   mpc_orb_jsonb->'COM',
+                   mpc_orb_jsonb->'epoch_data'->>'epoch',
+                   mpc_orb_jsonb->'magnitude_data'->>'H',
+                   mpc_orb_jsonb->'orbit_fit_statistics'
+              from public.mpc_orbits
+             where unpacked_primary_provisional_designation = any(%s)""",
+                    (list(designations),))
+        out = {}
+        for desig, com, epoch, h, stats in cur.fetchall():
+            if com is None or com.get("covariance") is None:
+                continue
+            names = com["coefficient_names"]
+            if names[:6] != _SBN_COM_NAMES:
+                raise RuntimeError("unexpected element order for %s: %s" % (desig, names))
+            n = len(names)
+            C = np.zeros((n, n))
+            bad = False
+            for key, v in com["covariance"].items():
+                i, j = int(key[3]), int(key[4])
+                if i >= n or j >= n:
+                    continue                      # the non-gravitational block
+                if v is None:
+                    bad = True
+                    continue
+                C[i, j] = C[j, i] = v
+            out[desig] = dict(
+                values=np.array(com["coefficient_values"][:6], dtype=float),
+                sigmas=np.array(com["coefficient_uncertainties"][:6], dtype=float),
+                cov=C[:6, :6], incomplete=bad,
+                epoch_mjd=float(epoch), h=float(h) if h is not None else np.nan,
+                stats=stats or {})
+        return out
+    finally:
+        if close:
+            conn.close()
+
+
+def _com_to_keplerian(samples, epoch_mjd, h):
+    """Cometary element samples (n, 6) -> the frame the apparition solver takes."""
+    q, e, inc, node, argperi, tperi = samples.T
+    # Far out along the line of variation a node can leave the physical region -- q below
+    # zero, or e at or above one -- for an orbit whose sigma_q is a sizeable fraction of q.
+    # Clamp to something still an orbit; those nodes carry little weight and non-finite
+    # apparitions are dropped downstream.
+    e = np.clip(e, 0.0, 0.99)
+    q = np.maximum(q, 0.01)
+    a = q / np.maximum(1.0 - e, 1e-6)
+    n_deg = _GAUSS_K_DEG / np.power(a, 1.5)
+    M = np.mod(n_deg * (epoch_mjd - tperi), 360.0)
+    return pd.DataFrame(dict(a=a, e=e, i=inc, Node=node, Peri=argperi, M=M,
+                             Epoch=np.full(len(a), epoch_mjd + _MJD_TO_JD),
+                             H=np.full(len(a), h)))
+
+
+def _lov_nodes(entry, n_nodes=_PESSIMISTIC_LOV_NODES):
+    """Orbits at Gauss-Hermite nodes along the line of variation of one covariance record.
+
+    A short-arc covariance is dominated by one direction (for one-opposition orbits the leading
+    eigenvector carries a median 99.9% of the variance), so a few quadrature nodes along it
+    reproduce a full 6-D Monte Carlo at a fraction of the cost. Returns (frame, weights) with
+    the weights summing to one; the middle node is the nominal orbit.
+    """
+    C = 0.5 * (entry["cov"] + entry["cov"].T)
+    w_eig, V = np.linalg.eigh(C)
+    k = int(np.argmax(w_eig))
+    lov = V[:, k] * np.sqrt(max(w_eig[k], 0.0))          # the 1-sigma step along the LOV
+    x, wq = np.polynomial.hermite_e.hermegauss(n_nodes)  # nodes in units of sigma
+    wq = wq / wq.sum()
+    draws = entry["values"][None, :] + x[:, None] * lov[None, :]
+    frame = _com_to_keplerian(draws, entry["epoch_mjd"], np.nan)
+    frame["H"] = np.full(n_nodes, entry["h"])
+    return frame, wq
+
+
+def _detectable_both(frame, h_offset, t_ref=_PESSIMISTIC_T_REF):
+    """The four detectable-apparition features at the frame's H and at H + h_offset, sharing one propagation."""
+    set_reference_epoch(t_ref)
+    G = _solve_apparitions(frame, n_opp=_DET_N_APPARITIONS, t_ref=t_ref)
+    return [np.column_stack(_detectable_from_apparitions(G, t_ref, h_offset=dh))
+            for dh in (0.0, h_offset)]
+
+
+def pessimistic_detectable_bounds(entries, n_nodes=_PESSIMISTIC_LOV_NODES,
+                                  h_offset=_PESSIMISTIC_H_OFFSET, verbose=False):
+    """Lower bound on n_detectable over the orbit covariance and a fainter H, per object.
+
+    `entries` is the {designation: record} mapping from sbn_fetch_covariances. Each object is
+    scored at n_nodes Gauss-Hermite nodes along its line of variation, at the catalogued H and
+    at H + h_offset (2 * n_nodes evaluations, n_nodes propagations, since H enters the apparent
+    magnitude as an additive constant). Returns a DataFrame with one row per object:
+    Principal_desig, n_detectable_nominal (nominal orbit, catalogued H), n_detectable_lower and
+    n_detectable_upper (min and max over the scenarios), n_detectable_lower_H (the pessimistic-H
+    arm alone), and the four DETECTABLE_COLS of the minimising scenario as <col>_lower, so the
+    substituted row is a self-consistent orbit rather than a mix. Objects without a finite H
+    are skipped; an empty DataFrame is returned when nothing can be scored.
+    """
+    desigs, frames = [], []
+    for desig, e in entries.items():
+        if not np.isfinite(e["h"]):
+            continue
+        f, _w = _lov_nodes(e, n_nodes)
+        frames.append(f)
+        desigs.append(desig)
+    if not frames:
+        return pd.DataFrame()
+    big = pd.concat(frames, ignore_index=True)
+    t0 = time.time()
+    F = np.empty((len(big), 2, len(DETECTABLE_COLS)))
+    for lo in range(0, len(big), _PESSIMISTIC_CHUNK_ROWS):
+        hi = min(lo + _PESSIMISTIC_CHUNK_ROWS, len(big))
+        a, b = _detectable_both(big.iloc[lo:hi], h_offset)
+        F[lo:hi, 0], F[lo:hi, 1] = a, b
+        if verbose:
+            print("  solved %d/%d node-rows (%.0fs)" % (hi, len(big), time.time() - t0),
+                  flush=True)
+    # (object, scenario, column) with the scenarios ordered [nodes at H, nodes at H + offset]
+    F = F.reshape(len(desigs), n_nodes, 2, len(DETECTABLE_COLS)).transpose(0, 2, 1, 3)
+    F = F.reshape(len(desigs), 2 * n_nodes, len(DETECTABLE_COLS))
+    n_detectable = F[:, :, 0]
+    k_min = np.argmin(np.where(np.isfinite(n_detectable), n_detectable, np.inf), axis=1)
+    mid = n_nodes // 2                      # the central Gauss-Hermite node, at the catalogued H
+    out = dict(Principal_desig=desigs,
+               n_detectable_nominal=n_detectable[:, mid],
+               n_detectable_lower=np.nanmin(n_detectable, axis=1),
+               n_detectable_upper=np.nanmax(n_detectable, axis=1),
+               n_detectable_lower_H=np.nanmin(n_detectable[:, n_nodes:], axis=1),
+               n_evals=2 * n_nodes, n_solves=n_nodes)
+    rows = np.arange(len(desigs))
+    for j, c in enumerate(DETECTABLE_COLS):
+        out[c + "_lower"] = F[rows, k_min, j]
+    return pd.DataFrame(out)
+
+
+_GRID_STEP_DAYS = 10.0          # time-grid sampling for the detectability windows
+_GRID_MIN_ELONG_DEG = 60.0      # an object closer than this to the Sun is not observable, however bright
+_GRID_CHUNK = 20000
+
+
+def add_detect_window_features(orb):
+    """Adds n_detect_windows: the number of separate intervals within the 20-yr lookback during which the
+    object was brighter than the era limiting magnitude AND more than _GRID_MIN_ELONG_DEG from the Sun,
+    on a _GRID_STEP_DAYS time grid.
+
+    Unlike the apparition features, which score each solved apparition at a single instant, this walks
+    the true geometry through the whole window, so it counts what was actually observable: an interior
+    object's equal-longitude events next to the Sun do not count, and an apparition that stayed above the
+    limit for only a few days counts the same as one that lasted months (duration itself did not add
+    anything on held-out data; the count did). Same elements, Earth ephemeris and magnitude model as
+    _solve_apparitions. Processed in row chunks to bound memory (~1 GB per 20k rows)."""
+    needed = ("a", "e", "i", "Node", "Peri", "M", "Epoch", "H")
+    if not all(c in orb.columns for c in needed):
+        orb["n_detect_windows"] = np.nan
+        return orb
+    f = lambda c: orb[c].to_numpy(dtype=np.float64)
+    a, e = f("a"), np.clip(f("e"), 0, 0.999)
+    inc, node, peri = np.radians(f("i")), np.radians(f("Node")), np.radians(f("Peri"))
+    M0, epoch, H = np.radians(f("M")), f("Epoch"), f("H")
+    n_mm = np.sqrt(0.0002959122082855911) / np.power(np.maximum(a, 1e-9), 1.5)
+    # The grid runs back from the shared reference date, not from each object's own epoch, for the
+    # same reason as the apparition window (see _reference_epoch).
+    t_ref = _reference_epoch(orb)
+    n_t = int(round(_LOOKBACK_DAYS / _GRID_STEP_DAYS)) + 1
+    offsets = np.arange(n_t)[None, :] * _GRID_STEP_DAYS
+    out = np.full(len(orb), np.nan)
+
+    def earth_xy(t):
+        T = (t - 2451545.0) / 36525.0
+        M = np.radians(357.52911 + 35999.05029 * T)
+        lam = (np.radians(280.46646 + 36000.76983 * T)
+               + 0.033416 * np.sin(M) + 0.000349 * np.sin(2.0 * M)) + np.pi
+        r = 1.00014061 - 0.01670861 * np.cos(M) - 0.00013957 * np.cos(2.0 * M)
+        return r * np.cos(lam), r * np.sin(lam)
+
+    for s0 in range(0, len(orb), _GRID_CHUNK):
+        sl = slice(s0, min(len(orb), s0 + _GRID_CHUNK))
+        B = lambda v: v[sl][:, None]
+        t = t_ref - offsets
+        MM = np.mod(B(M0) + B(n_mm) * (t - B(epoch)) + np.pi, 2.0 * np.pi) - np.pi
+        E_ = B(e)
+        EA = MM + E_ * np.sin(MM)
+        for _ in range(10):
+            EA = EA - (EA - E_ * np.sin(EA) - MM) / np.maximum(1.0 - E_ * np.cos(EA), 1e-12)
+        nu = 2.0 * np.arctan2(np.sqrt(1 + E_) * np.sin(EA / 2), np.sqrt(1 - E_) * np.cos(EA / 2))
+        r = B(a) * (1.0 - E_ * np.cos(EA))
+        u = B(peri) + nu
+        cu, su, ci, si, cO, sO = np.cos(u), np.sin(u), np.cos(B(inc)), np.sin(B(inc)), np.cos(B(node)), np.sin(B(node))
+        x, y, z = r * (cO * cu - sO * su * ci), r * (sO * cu + cO * su * ci), r * su * si
+        xe, ye = earth_xy(t)
+        dx, dy, dz = x - xe, y - ye, z
+        delta = np.sqrt(dx * dx + dy * dy + dz * dz)
+        with np.errstate(all="ignore"):
+            cos_alpha = np.clip((x * dx + y * dy + z * dz) / np.maximum(r * delta, 1e-12), -1.0, 1.0)
+            V = B(H) + 5.0 * np.log10(np.maximum(r * delta, 1e-12)) - 2.5 * np.log10(hg_phase(np.arccos(cos_alpha)))
+            re_ = np.sqrt(xe * xe + ye * ye)
+            cos_elong = np.clip(-(xe * dx + ye * dy) / np.maximum(re_ * delta, 1e-12), -1.0, 1.0)
+            year = 2000.0 + (t - 2451545.0) / 365.25
+            det = (V < _threshold_magnitude(year)) & (cos_elong < np.cos(np.radians(_GRID_MIN_ELONG_DEG)))
+        d = det.astype(np.int8)
+        out[sl] = d[:, 0] + ((d[:, 1:] == 1) & (d[:, :-1] == 0)).sum(axis=1)   # number of runs of consecutive detectable samples
+    orb["n_detect_windows"] = out.astype(float)
     return orb
 
 
